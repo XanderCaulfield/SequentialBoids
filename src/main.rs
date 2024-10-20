@@ -3,13 +3,18 @@ use bevy::sprite::MaterialMesh2dBundle;
 use rand::Rng;
 
 
-const BOID_COUNT: usize = 200;
-const BOID_SPEED_LIMIT: f32 = 200.0;
+const BOID_COUNT: usize = 2000;
+const BOID_SPEED_LIMIT: f32 = 300.0;
+const MAX_TURN_RATE: f32 = 30.0;
+const MAX_RANDOM_TURN_INTERVAL: f32 = 3.0;
+const TRAIL_LENGTH: usize = 50;
 
 #[derive(Component)]
 struct Boid {
     velocity: Vec2,
     trail: Vec<Vec2>,
+    last_random_turn_time: f32,
+    next_random_turn_interval: f32,
 }
 
 #[derive(Resource)]
@@ -35,11 +40,11 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .insert_resource(SimulationParams {
-            coherence: 0.005,
+            coherence: 0.05,
             separation: 0.05,
             alignment: 0.05,
             visual_range: 75.0,
-            trace_paths: false,
+            trace_paths: true,
         })
         .add_systems(Startup, (setup, setup_ui))
         .add_systems(Update, (
@@ -69,6 +74,8 @@ fn spawn_boids(
             Boid {
                 velocity,
                 trail: Vec::new(),
+                last_random_turn_time: 0.,
+                next_random_turn_interval: (rng.gen_range(0.0..MAX_RANDOM_TURN_INTERVAL))
             },
             MaterialMesh2dBundle {
                 mesh: triangle.clone().into(),
@@ -244,78 +251,37 @@ fn spawn_button(parent: &mut ChildBuilder, text: &str, ui_element: UIElement) {
     });
 }
 
-fn update_ui(
-    mut interaction_query: Query<
-        (&Interaction, &UIElement, &mut BackgroundColor, &Node, &GlobalTransform),
-        (Changed<Interaction>, With<UIElement>),
-    >,
-    mut sim_params: ResMut<SimulationParams>,
-    q_window: Query<&Window>,
-    camera_q: Query<(&Camera, &GlobalTransform)>,
-) {
-    let (camera, camera_transform) = camera_q.single();
-    let window = q_window.single();
-
-    for (interaction, ui_element, mut color, node, transform) in interaction_query.iter_mut() {
-        match *interaction {
-            Interaction::Pressed => {
-                *color = Color::srgb(0.50, 0.50, 0.50).into();
-                if let Some(cursor_position) = window.cursor_position() {
-                    if let Some(ray) = camera.viewport_to_world(camera_transform, cursor_position) {
-                        // Project the ray onto the xy-plane (z = 0)
-                        let distance = -ray.origin.z / ray.direction.z;
-                        let world_position = ray.origin + ray.direction * distance;
-
-                        let ui_position = Vec2::new(transform.translation().x, transform.translation().y);
-                        let ui_size = node.size();
-                        
-                        // Calculate relative position within the UI element
-                        let relative_pos = (Vec2::new(world_position.x, world_position.y) - ui_position + ui_size / 2.0) / ui_size;
-                        
-                        if relative_pos.x >= 0.0 && relative_pos.x <= 1.0 && relative_pos.y >= 0.0 && relative_pos.y <= 1.0 {
-                            let value = relative_pos.x.clamp(0.0, 1.0);
-                            match ui_element {
-                                UIElement::CoherenceSlider => sim_params.coherence = value * 0.02,
-                                UIElement::SeparationSlider => sim_params.separation = value * 0.2,
-                                UIElement::AlignmentSlider => sim_params.alignment = value * 0.1,
-                                UIElement::VisualRangeSlider => sim_params.visual_range = value * 200.0,
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-            Interaction::Hovered => {
-                *color = Color::srgb(0.25, 0.25, 0.25).into();
-            }
-            Interaction::None => {
-                *color = Color::srgb(0.15, 0.15, 0.15).into();
-            }
-        }
-    }
-}
-
-
 
 fn handle_button_clicks(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
-    interaction_query: Query<(&Interaction, &UIElement), (Changed<Interaction>, With<UIElement>)>,
+    interaction_query: Query<(&Interaction, &UIElement, &Children), (Changed<Interaction>, With<UIElement>)>,
     mut sim_params: ResMut<SimulationParams>,
     boid_query: Query<Entity, With<Boid>>,
+    mut text_query: Query<&mut Text>,
 ) {
-    for (interaction, ui_element) in interaction_query.iter() {
+    for (interaction, ui_element, children) in interaction_query.iter() {
         if let Interaction::Pressed = *interaction {
             match ui_element {
                 UIElement::ResetButton => reset_boids(&mut commands, &mut meshes, &mut materials, &boid_query),
-                UIElement::TracePathsButton => sim_params.trace_paths = !sim_params.trace_paths,
+                UIElement::TracePathsButton => {
+                    sim_params.trace_paths = !sim_params.trace_paths;
+                    if let Some(child) = children.first() {
+                        if let Ok(mut text) = text_query.get_mut(*child) {
+                            text.sections[0].value = if sim_params.trace_paths {
+                                "Hide Paths".to_string()
+                            } else {
+                                "Show Paths".to_string()
+                            };
+                        }
+                    }
+                }
                 _ => {}
             }
         }
     }
 }
-
 fn update_boids(
     mut query: Query<(&mut Transform, &mut Boid)>,
     params: Res<SimulationParams>,
@@ -331,6 +297,8 @@ fn update_boids(
         .map(|(transform, boid)| (transform.translation.truncate(), boid.velocity))
         .collect();
 
+    let mut rng = rand::thread_rng();
+
     for (mut transform, mut boid) in query.iter_mut() {
         let mut position = transform.translation.truncate();
 
@@ -344,13 +312,12 @@ fn update_boids(
             let distance = diff.length();
 
             if distance < params.visual_range && distance > 0.0 {
-
                 // Coherence
                 center_of_mass += *other_pos;
 
-                // Separation
+                // Separation (increased effect for closer boids)
                 if distance < params.visual_range / 2.0 {
-                    avoid_vector -= diff.normalize() / distance;
+                    avoid_vector -= diff.normalize() * (params.visual_range / (2.0 * distance.max(0.1)));
                 }
 
                 // Alignment
@@ -371,12 +338,26 @@ fn update_boids(
             boid.velocity += coherence + separation + alignment;
         }
 
-        // Limit speed
-        let speed = boid.velocity.length();
-        if speed > BOID_SPEED_LIMIT {
-            boid.velocity = boid.velocity.normalize() * BOID_SPEED_LIMIT;
-        } else if speed < BOID_SPEED_LIMIT / 2.0 {
+        // Apply random turning at individual random intervals
+        if time.elapsed_seconds() - boid.last_random_turn_time > boid.next_random_turn_interval {
+            let turn_angle = rng.gen_range(-MAX_TURN_RATE..MAX_TURN_RATE) * time.delta_seconds();
+            let (sin, cos) = turn_angle.sin_cos();
+            let new_velocity = Vec2::new(
+                boid.velocity.x * cos - boid.velocity.y * sin,
+                boid.velocity.x * sin + boid.velocity.y * cos
+            );
+            boid.velocity = new_velocity.normalize() * boid.velocity.length();
+            
+            boid.last_random_turn_time = time.elapsed_seconds();
+            boid.next_random_turn_interval = rng.gen_range(0.0..MAX_RANDOM_TURN_INTERVAL);
+        }
+
+        // Maintain speed
+        let current_speed = boid.velocity.length();
+        if current_speed < BOID_SPEED_LIMIT / 2.0 {
             boid.velocity = boid.velocity.normalize() * (BOID_SPEED_LIMIT / 2.0);
+        } else if current_speed > BOID_SPEED_LIMIT {
+            boid.velocity = boid.velocity.normalize() * BOID_SPEED_LIMIT;
         }
 
         // Update position
@@ -384,8 +365,8 @@ fn update_boids(
         position += boid.velocity * delta_time;
 
         // Wrap around screen edges
-        position.x = (position.x + width / 2.0) % width - width / 2.0;
-        position.y = (position.y + height / 2.0) % height - height / 2.0;
+        position.x = (position.x + width) % width - width / 2.0;
+        position.y = (position.y + height) % height - height / 2.0;
 
         transform.translation = position.extend(transform.translation.z);
 
@@ -412,36 +393,46 @@ fn move_boids(
 
         // Wrap around screen edges
         let wrapped_position = Vec2::new(
-            (new_position.x + width / 2.0) % width - width / 2.0,
-            (new_position.y + height / 2.0) % height - height / 2.0,
+            (new_position.x + width) % width - width / 2.0,
+            (new_position.y + height) % height - height / 2.0,
         );
 
         transform.translation = wrapped_position.extend(transform.translation.z);
 
         // Update trail
         if boid.trail.is_empty() || wrapped_position.distance(*boid.trail.last().unwrap()) > 5.0 {
-            if !boid.trail.is_empty() {
-                let last_pos = boid.trail.last().unwrap();
-                if (wrapped_position.x - last_pos.x).abs() > width / 2.0 ||
-                   (wrapped_position.y - last_pos.y).abs() > height / 2.0 {
-                    // If the boid has wrapped, start a new trail
-                    boid.trail.clear();
-                }
-            }
             boid.trail.push(wrapped_position);
-            if boid.trail.len() > 50 {
+            if boid.trail.len() > TRAIL_LENGTH {
                 boid.trail.remove(0);
             }
         }
     }
 }
 
-fn update_trails(mut gizmos: Gizmos, query: Query<&Boid>, sim_params: Res<SimulationParams>) {
+fn update_trails(mut gizmos: Gizmos, query: Query<&Boid>, sim_params: Res<SimulationParams>, window_query: Query<&Window>) {
     if sim_params.trace_paths {
+        let window = window_query.single();
+        let width = window.width();
+        let height = window.height();
+
         for boid in query.iter() {
             for window in boid.trail.windows(2) {
                 if let [start, end] = window {
-                    gizmos.line_2d(*start, *end, Color::srgba(0.33, 0.55, 0.95, 0.1));
+                    let start_wrapped = Vec2::new(
+                        (start.x + width) % width - width / 2.0,
+                        (start.y + height) % height - height / 2.0,
+                    );
+                    let end_wrapped = Vec2::new(
+                        (end.x + width) % width - width / 2.0,
+                        (end.y + height) % height - height / 2.0,
+                    );
+
+                    // Check if the line crosses the screen edge
+                    if (start_wrapped - end_wrapped).length() > width / 2.0 || (start_wrapped - end_wrapped).length() > height / 2.0 {
+                        continue; // Skip drawing this line segment
+                    }
+
+                    gizmos.line_2d(start_wrapped, end_wrapped, Color::srgba(0.33, 0.55, 0.95, 0.1));
                 }
             }
         }

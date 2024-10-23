@@ -1,3 +1,6 @@
+use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
+use bevy::input::keyboard::KeyboardInput;
+use bevy::input::ButtonState;
 use bevy::prelude::*;
 use bevy::sprite::MaterialMesh2dBundle;
 use rand::Rng;
@@ -52,6 +55,7 @@ struct TextInput {
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
+        .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .insert_resource(SimulationParams {
             coherence: 0.04,
             separation: 0.2,
@@ -63,6 +67,8 @@ fn main() {
         .add_systems(Update, (
             update_boids,
             move_boids,
+            handle_text_input,
+            update_fps_text,
             update_text_inputs,
             handle_button_clicks,
             update_trails,
@@ -137,8 +143,34 @@ fn setup_ui(mut commands: Commands) {
             ..default()
         })
         .with_children(|parent| {
-            parent
-                .spawn(NodeBundle {
+
+            // Add FPS counter to the top left of the screen
+
+            parent.spawn(NodeBundle {
+                style: Style {
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(10.0),
+                    left: Val::Px(10.0),
+                    ..default()
+                },
+                ..default()
+            })
+            .with_children(|parent| {
+                parent.spawn((
+                    TextBundle::from_section(
+                        "FPS: --",
+                        TextStyle {
+                            font_size: 20.0,
+                            color: Color::WHITE,
+                            ..default()
+                        },
+                    ),
+                    FpsText,
+                ));
+            });
+
+
+            parent.spawn(NodeBundle {
                     style: Style {
                         width: Val::Percent(100.0),
                         height: Val::Px(100.0),
@@ -162,6 +194,19 @@ fn setup_ui(mut commands: Commands) {
         });
 }
 
+fn update_fps_text(
+    diagnostics: Res<DiagnosticsStore>,
+    mut query: Query<&mut Text, With<FpsText>>,
+) {
+    if let Some(fps) = diagnostics.get(&FrameTimeDiagnosticsPlugin::FPS) {
+        if let Some(value) = fps.smoothed() {
+            for mut text in query.iter_mut() {
+                text.sections[0].value = format!("FPS: {:.1}", value);
+            }
+        }
+    }
+}
+
 fn spawn_text_input(parent: &mut ChildBuilder, label: &str, default_value: &str, ui_element: UIElement) {
     parent
         .spawn(NodeBundle {
@@ -170,7 +215,7 @@ fn spawn_text_input(parent: &mut ChildBuilder, label: &str, default_value: &str,
                 align_items: AlignItems::Start,
                 margin: UiRect {
                     top: Val::ZERO,
-                    bottom: Val::Px(5.0),  // Add spacing between input groups
+                    bottom: Val::Px(5.0),
                     left: Val::ZERO,
                     right: Val::ZERO,
                 },
@@ -210,9 +255,88 @@ fn spawn_text_input(parent: &mut ChildBuilder, label: &str, default_value: &str,
                     ..default()
                 },
                 ui_element,
+                TextInput {
+                    is_focused: false,
+                    buffer: default_value.to_string(),
+                },
                 Interaction::default(),
             ));
         });
+}
+
+fn handle_text_input(
+    mut text_query: Query<(&mut TextInput, &mut Text, &mut BackgroundColor, &Interaction, &UIElement)>,
+    mut sim_params: ResMut<SimulationParams>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut keyboard_events: EventReader<KeyboardInput>,
+) {
+    // Handle focus changes
+    if mouse.just_pressed(MouseButton::Left) {
+        for (mut input, _, mut bg_color, interaction, _) in text_query.iter_mut() {
+            input.is_focused = matches!(interaction, Interaction::Pressed);
+            *bg_color = if input.is_focused {
+                Color::srgb(0.9, 0.9, 1.0).into()
+            } else {
+                Color::WHITE.into()
+            };
+        }
+    }
+
+    // Handle keyboard input
+    for event in keyboard_events.read() {
+        if event.state == ButtonState::Pressed {
+            // Find the focused text input
+            for (mut input, mut text, _, _, ui_element) in text_query.iter_mut() {
+                if input.is_focused {
+                    match event.key_code {
+                        KeyCode::Backspace => {
+                            input.buffer.pop();
+                            text.sections[0].value = input.buffer.clone();
+                        }
+                        KeyCode::Enter => {
+                            if let Ok(value) = input.buffer.parse::<f32>() {
+                                // Update simulation parameters based on the UI element type
+                                match ui_element {
+                                    UIElement::CoherenceInput => sim_params.coherence = value,
+                                    UIElement::SeparationInput => sim_params.separation = value,
+                                    UIElement::AlignmentInput => sim_params.alignment = value,
+                                    UIElement::VisualRangeInput => sim_params.visual_range = value,
+                                    _ => {}
+                                }
+                            }
+                            input.is_focused = false;
+                        }
+                        // Handle numeric input and decimal point
+                        key_code => {
+                            if let Some(char) = key_code_to_char(key_code) {
+                                if char.is_ascii_digit() || char == '.' {
+                                    input.buffer.push(char);
+                                    text.sections[0].value = input.buffer.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn key_code_to_char(key_code: KeyCode) -> Option<char> {
+    match key_code {
+        KeyCode::Digit0 | KeyCode::Numpad0 => Some('0'),
+        KeyCode::Digit1 | KeyCode::Numpad1 => Some('1'),
+        KeyCode::Digit2 | KeyCode::Numpad2 => Some('2'),
+        KeyCode::Digit3 | KeyCode::Numpad3 => Some('3'),
+        KeyCode::Digit4 | KeyCode::Numpad4 => Some('4'),
+        KeyCode::Digit5 | KeyCode::Numpad5 => Some('5'),
+        KeyCode::Digit6 | KeyCode::Numpad6 => Some('6'),
+        KeyCode::Digit7 | KeyCode::Numpad7 => Some('7'),
+        KeyCode::Digit8 | KeyCode::Numpad8 => Some('8'),
+        KeyCode::Digit9 | KeyCode::Numpad9 => Some('9'),
+        KeyCode::Period | KeyCode::NumpadDecimal => Some('.'),
+        _ => None,
+    }
 }
 
 fn update_text_inputs(

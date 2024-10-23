@@ -5,21 +5,28 @@ use bevy::input::ButtonState;
 use bevy::prelude::*;
 use bevy::sprite::MaterialMesh2dBundle;
 use rand::Rng;
+use noise::{NoiseFn, Perlin};
 
 // Constants
 const BOID_COUNT: usize = 2000;
 const BOID_SPEED_LIMIT: f32 = 300.0;
-const MAX_TURN_RATE: f32 = 30.0;
-const MAX_RANDOM_TURN_INTERVAL: f32 = 3.0;
 const TRAIL_LENGTH: usize = 25;
 
-// The Boid itself.
+
+// Noise gen for random movement
+const NOISE_SCALE: f32 = 0.1;    // Adjusts how quickly the noise pattern changes.
+const NOISE_STRENGTH: f32 = 100.0;  // Adjusts how strong the random turning force is.
+const TIME_SCALE: f32 = 0.02;       // How quickly the noise pattern evolves over time
+
+// The Almighty Boid
 #[derive(Component)]
 struct Boid {
     velocity: Vec2,
     trail: Vec<Vec2>,
-    last_random_turn_time: f32,
-    next_random_turn_interval: f32,
+    noise_offset_x: f32,
+    noise_offset_y: f32,
+    noise_offset_z: f32,    // For time-based variation.
+    noise_seed: f32,        // For per-boid variation.
 }
 
 // Parameters that influence the behaviour of the boids.
@@ -68,10 +75,10 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .insert_resource(SimulationParams {
-            coherence: 0.02,
-            separation: 0.15,
-            alignment: 0.15,
-            visual_range: 60.0,
+            coherence: 0.015,      // Match UI value
+            separation: 0.25,      // Match UI value
+            alignment: 0.125,      // Match UI value
+            visual_range: 75.0,    // Match UI value
             trace_paths: false,
         })
         .add_systems(Startup, (setup, setup_ui))
@@ -106,8 +113,10 @@ fn spawn_boids(
             Boid {
                 velocity,
                 trail: Vec::new(),
-                last_random_turn_time: 0.,
-                next_random_turn_interval: (rng.gen_range(0.0..MAX_RANDOM_TURN_INTERVAL))
+                noise_offset_x: rng.gen_range(-1000.0..1000.0),
+                noise_offset_y: rng.gen_range(-1000.0..1000.0),
+                noise_offset_z: rng.gen_range(-1000.0..1000.0),
+                noise_seed: rng.gen_range(0.0..100.0),
             },
             MaterialMesh2dBundle {
                 mesh: triangle.clone().into(),
@@ -119,6 +128,7 @@ fn spawn_boids(
         ));
     }
 }
+
 
 fn setup(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut materials: ResMut<Assets<ColorMaterial>>) {
     commands.spawn(Camera2dBundle::default());
@@ -155,9 +165,7 @@ fn setup_ui(mut commands: Commands) {
             ..default()
         })
         .with_children(|parent| {
-
             // Add FPS counter to the top left of the screen
-
             parent.spawn(NodeBundle {
                 style: Style {
                     position_type: PositionType::Absolute,
@@ -181,7 +189,6 @@ fn setup_ui(mut commands: Commands) {
                 ));
             });
 
-
             parent.spawn(NodeBundle {
                     style: Style {
                         width: Val::Percent(100.0),
@@ -196,10 +203,10 @@ fn setup_ui(mut commands: Commands) {
                     ..default()
                 })
                 .with_children(|parent| {
-                    spawn_text_input(parent, "Coherence", "0.02", UIElement::CoherenceInput);
-                    spawn_text_input(parent, "Separation", "0.15", UIElement::SeparationInput);
-                    spawn_text_input(parent, "Alignment", "0.15", UIElement::AlignmentInput);
-                    spawn_text_input(parent, "Visual Range", "60.0", UIElement::VisualRangeInput);
+                    spawn_text_input(parent, "Coherence", "0.015", UIElement::CoherenceInput);      // Updated
+                    spawn_text_input(parent, "Separation", "0.25", UIElement::SeparationInput);     // Updated
+                    spawn_text_input(parent, "Alignment", "0.125", UIElement::AlignmentInput);      // Updated
+                    spawn_text_input(parent, "Visual Range", "75.0", UIElement::VisualRangeInput); // Updated
                     spawn_button(parent, "Reset", UIElement::ResetButton);
                     spawn_button(parent, "Trace Paths", UIElement::TracePathsButton);
                 });
@@ -545,17 +552,19 @@ fn update_boids(
     let window = window_query.single();
     let width = window.width();
     let height = window.height();
+    
+    let perlin = Perlin::new(1);
+    let current_time = time.elapsed_seconds() * TIME_SCALE;
 
     let boids: Vec<(Vec2, Vec2)> = query
         .iter()
         .map(|(transform, boid)| (transform.translation.truncate(), boid.velocity))
         .collect();
 
-    let mut rng = rand::thread_rng();
-
     for (mut transform, mut boid) in query.iter_mut() {
         let mut position = transform.translation.truncate();
 
+        // Main flocking behavior
         let mut center_of_mass = Vec2::ZERO;
         let mut avoid_vector = Vec2::ZERO;
         let mut average_velocity = Vec2::ZERO;
@@ -581,6 +590,7 @@ fn update_boids(
             }
         }
 
+        // Calculate and apply flocking forces
         if num_neighbors > 0 {
             center_of_mass /= num_neighbors as f32;
             average_velocity /= num_neighbors as f32;
@@ -592,19 +602,28 @@ fn update_boids(
             boid.velocity += coherence + separation + alignment;
         }
 
-        // Apply random turning at individual random intervals
-        if time.elapsed_seconds() - boid.last_random_turn_time > boid.next_random_turn_interval {
-            let turn_angle = rng.gen_range(-MAX_TURN_RATE..MAX_TURN_RATE) * time.delta_seconds();
-            let (sin, cos) = turn_angle.sin_cos();
-            let new_velocity = Vec2::new(
-                boid.velocity.x * cos - boid.velocity.y * sin,
-                boid.velocity.x * sin + boid.velocity.y * cos
-            );
-            boid.velocity = new_velocity.normalize() * boid.velocity.length();
-            
-            boid.last_random_turn_time = time.elapsed_seconds();
-            boid.next_random_turn_interval = rng.gen_range(0.0..MAX_RANDOM_TURN_INTERVAL);
-        }
+        // Add very subtle random variation
+        boid.noise_offset_x += NOISE_SCALE * time.delta_seconds();
+        boid.noise_offset_y += NOISE_SCALE * time.delta_seconds();
+        boid.noise_offset_z = current_time;
+        
+        let noise_value = perlin.get([
+            boid.noise_offset_x as f64,
+            boid.noise_offset_y as f64,
+            boid.noise_offset_z as f64,
+            boid.noise_seed as f64,
+        ]) as f32;
+        
+        // Apply tiny steering adjustment
+        let turn_angle = noise_value * NOISE_STRENGTH * time.delta_seconds();
+        let (sin, cos) = turn_angle.sin_cos();
+        let slight_adjustment = Vec2::new(
+            boid.velocity.x * cos - boid.velocity.y * sin,
+            boid.velocity.x * sin + boid.velocity.y * cos
+        ).normalize();
+        
+        // Apply very subtle adjustment to velocity
+        boid.velocity = boid.velocity.lerp(slight_adjustment * boid.velocity.length(), 0.01);
 
         // Maintain speed
         let current_speed = boid.velocity.length();

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 bevy = "0.14.2"
 rand = "0.8.5"
+noise = "0.9"
 
 # Enable a small amount of optimization in debug mode
 [profile.dev]

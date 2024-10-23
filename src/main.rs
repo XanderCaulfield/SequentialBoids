@@ -68,10 +68,10 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .insert_resource(SimulationParams {
-            coherence: 0.075,
-            separation: 0.5,
-            alignment: 0.05,
-            visual_range: 75.0,
+            coherence: 0.02,
+            separation: 0.15,
+            alignment: 0.15,
+            visual_range: 60.0,
             trace_paths: false,
         })
         .add_systems(Startup, (setup, setup_ui))
@@ -196,10 +196,10 @@ fn setup_ui(mut commands: Commands) {
                     ..default()
                 })
                 .with_children(|parent| {
-                    spawn_text_input(parent, "Coherence", "0.05", UIElement::CoherenceInput);
-                    spawn_text_input(parent, "Separation", "0.1", UIElement::SeparationInput);
-                    spawn_text_input(parent, "Alignment", "0.05", UIElement::AlignmentInput);
-                    spawn_text_input(parent, "Visual Range", "75.0", UIElement::VisualRangeInput);
+                    spawn_text_input(parent, "Coherence", "0.02", UIElement::CoherenceInput);
+                    spawn_text_input(parent, "Separation", "0.15", UIElement::SeparationInput);
+                    spawn_text_input(parent, "Alignment", "0.15", UIElement::AlignmentInput);
+                    spawn_text_input(parent, "Visual Range", "60.0", UIElement::VisualRangeInput);
                     spawn_button(parent, "Reset", UIElement::ResetButton);
                     spawn_button(parent, "Trace Paths", UIElement::TracePathsButton);
                 });

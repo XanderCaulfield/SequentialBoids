@@ -2,13 +2,14 @@ use bevy::prelude::*;
 use bevy::sprite::MaterialMesh2dBundle;
 use rand::Rng;
 
-
+// Constants
 const BOID_COUNT: usize = 2000;
 const BOID_SPEED_LIMIT: f32 = 300.0;
 const MAX_TURN_RATE: f32 = 30.0;
 const MAX_RANDOM_TURN_INTERVAL: f32 = 3.0;
 const TRAIL_LENGTH: usize = 50;
 
+// The Boid itself.
 #[derive(Component)]
 struct Boid {
     velocity: Vec2,
@@ -17,6 +18,7 @@ struct Boid {
     next_random_turn_interval: f32,
 }
 
+// Parameters that influence the behaviour of the boids.
 #[derive(Resource)]
 struct SimulationParams {
     coherence: f32,
@@ -26,31 +28,48 @@ struct SimulationParams {
     trace_paths: bool,
 }
 
+// User interface elements.
 #[derive(Component)]
 enum UIElement {
+    CoherenceInput,
+    SeparationInput,
+    AlignmentInput,
+    VisualRangeInput,
     ResetButton,
     TracePathsButton,
+}
+// FPS Counter
+#[derive(Component)]
+struct FpsText;
+
+// Text Input Fields
+#[derive(Component)]
+struct TextInput {
+    is_focused: bool,
+    buffer: String,
 }
 
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .insert_resource(SimulationParams {
-            coherence: 0.05,
-            separation: 0.1,
-            alignment: 0.05,
-            visual_range: 75.0,
+            coherence: 0.04,
+            separation: 0.2,
+            alignment: 0.03,
+            visual_range: 100.0,
             trace_paths: true,
         })
         .add_systems(Startup, (setup, setup_ui))
         .add_systems(Update, (
             update_boids,
             move_boids,
+            update_text_inputs,
             handle_button_clicks,
             update_trails,
         ))
         .run();
 }
+
 fn spawn_boids(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
@@ -126,16 +145,103 @@ fn setup_ui(mut commands: Commands) {
                         flex_direction: FlexDirection::Row,
                         align_items: AlignItems::Center,
                         justify_content: JustifyContent::SpaceEvenly,
+                        padding: UiRect::all(Val::Px(10.0)),
                         ..default()
                     },
                     background_color: Color::srgba(0.1, 0.1, 0.1, 0.5).into(),
                     ..default()
                 })
                 .with_children(|parent| {
+                    spawn_text_input(parent, "Coherence", "0.05", UIElement::CoherenceInput);
+                    spawn_text_input(parent, "Separation", "0.1", UIElement::SeparationInput);
+                    spawn_text_input(parent, "Alignment", "0.05", UIElement::AlignmentInput);
+                    spawn_text_input(parent, "Visual Range", "75.0", UIElement::VisualRangeInput);
                     spawn_button(parent, "Reset", UIElement::ResetButton);
                     spawn_button(parent, "Trace Paths", UIElement::TracePathsButton);
                 });
         });
+}
+
+fn spawn_text_input(parent: &mut ChildBuilder, label: &str, default_value: &str, ui_element: UIElement) {
+    parent
+        .spawn(NodeBundle {
+            style: Style {
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Start,
+                margin: UiRect {
+                    top: Val::ZERO,
+                    bottom: Val::Px(5.0),  // Add spacing between input groups
+                    left: Val::ZERO,
+                    right: Val::ZERO,
+                },
+                ..default()
+            },
+            ..default()
+        })
+        .with_children(|parent| {
+            // Label
+            parent.spawn(TextBundle::from_section(
+                label,
+                TextStyle {
+                    font_size: 16.0,
+                    color: Color::WHITE,
+                    ..default()
+                },
+            ));
+            
+            // Text input box
+            parent.spawn((
+                TextBundle {
+                    text: Text::from_section(
+                        default_value.to_string(),
+                        TextStyle {
+                            font_size: 16.0,
+                            color: Color::BLACK,
+                            ..default()
+                        },
+                    ),
+                    style: Style {
+                        width: Val::Px(80.0),
+                        height: Val::Px(30.0),
+                        padding: UiRect::all(Val::Px(5.0)),
+                        ..default()
+                    },
+                    background_color: Color::WHITE.into(),
+                    ..default()
+                },
+                ui_element,
+                Interaction::default(),
+            ));
+        });
+}
+
+fn update_text_inputs(
+    mut text_query: Query<(&mut Text, &UIElement, &Interaction), (Changed<Interaction>, With<UIElement>)>,
+    mut sim_params: ResMut<SimulationParams>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+) {
+    for (text, ui_element, interaction) in text_query.iter_mut() {
+        if let Interaction::Pressed = *interaction {
+            // Handle text input focus if needed
+            continue;
+        }
+
+        // Only process if Enter is pressed
+        if !keyboard.just_pressed(KeyCode::Enter) {
+            continue;
+        }
+
+        let current_value = &text.sections[0].value;
+        if let Ok(value) = current_value.parse::<f32>() {
+            match ui_element {
+                UIElement::CoherenceInput => sim_params.coherence = value,
+                UIElement::SeparationInput => sim_params.separation = value,
+                UIElement::AlignmentInput => sim_params.alignment = value,
+                UIElement::VisualRangeInput => sim_params.visual_range = value,
+                _ => {}
+            }
+        }
+    }
 }
 
 fn spawn_button(parent: &mut ChildBuilder, text: &str, ui_element: UIElement) {
@@ -191,10 +297,14 @@ fn handle_button_clicks(
                         }
                     }
                 }
+                // Add catch-all for input elements since they don't need button click handling
+                UIElement::CoherenceInput | UIElement::SeparationInput | 
+                UIElement::AlignmentInput | UIElement::VisualRangeInput => {}
             }
         }
     }
 }
+
 fn update_boids(
     mut query: Query<(&mut Transform, &mut Boid)>,
     params: Res<SimulationParams>,

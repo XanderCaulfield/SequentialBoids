@@ -1,4 +1,5 @@
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
+use bevy::time::{Timer, TimerMode};
 use bevy::input::keyboard::KeyboardInput;
 use bevy::input::ButtonState;
 use bevy::prelude::*;
@@ -10,7 +11,7 @@ const BOID_COUNT: usize = 2000;
 const BOID_SPEED_LIMIT: f32 = 300.0;
 const MAX_TURN_RATE: f32 = 30.0;
 const MAX_RANDOM_TURN_INTERVAL: f32 = 3.0;
-const TRAIL_LENGTH: usize = 50;
+const TRAIL_LENGTH: usize = 25;
 
 // The Boid itself.
 #[derive(Component)]
@@ -50,6 +51,16 @@ struct FpsText;
 struct TextInput {
     is_focused: bool,
     buffer: String,
+    cursor_visible: bool,
+    cursor_timer: Timer,
+    cursor_position: usize,
+}
+
+#[derive(Clone)]
+struct TextState {
+    buffer: String,
+    cursor_position: usize,
+    cursor_visible: bool,
 }
 
 fn main() {
@@ -57,11 +68,11 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .insert_resource(SimulationParams {
-            coherence: 0.04,
-            separation: 0.2,
-            alignment: 0.03,
-            visual_range: 100.0,
-            trace_paths: true,
+            coherence: 0.075,
+            separation: 0.5,
+            alignment: 0.05,
+            visual_range: 75.0,
+            trace_paths: false,
         })
         .add_systems(Startup, (setup, setup_ui))
         .add_systems(Update, (
@@ -70,6 +81,7 @@ fn main() {
             handle_text_input,
             update_fps_text,
             update_text_inputs,
+            update_cursor,
             handle_button_clicks,
             update_trails,
         ))
@@ -258,6 +270,9 @@ fn spawn_text_input(parent: &mut ChildBuilder, label: &str, default_value: &str,
                 TextInput {
                     is_focused: false,
                     buffer: default_value.to_string(),
+                    cursor_visible: true,
+                    cursor_timer: Timer::from_seconds(0.5, TimerMode::Repeating),
+                    cursor_position: default_value.len(), // Start cursor at end of text
                 },
                 Interaction::default(),
             ));
@@ -272,8 +287,21 @@ fn handle_text_input(
 ) {
     // Handle focus changes
     if mouse.just_pressed(MouseButton::Left) {
-        for (mut input, _, mut bg_color, interaction, _) in text_query.iter_mut() {
+        for (mut input, mut text, mut bg_color, interaction, _) in text_query.iter_mut() {
+            let was_focused = input.is_focused;
             input.is_focused = matches!(interaction, Interaction::Pressed);
+            
+            if input.is_focused != was_focused {
+                // Create a separate state struct to avoid borrowing conflicts
+                let state = TextState {
+                    buffer: input.buffer.clone(),
+                    cursor_position: input.buffer.len(),
+                    cursor_visible: input.is_focused,
+                };
+                
+                update_text_state(&mut input, &mut text, state);
+            }
+            
             *bg_color = if input.is_focused {
                 Color::srgb(0.9, 0.9, 1.0).into()
             } else {
@@ -285,42 +313,95 @@ fn handle_text_input(
     // Handle keyboard input
     for event in keyboard_events.read() {
         if event.state == ButtonState::Pressed {
-            // Find the focused text input
             for (mut input, mut text, _, _, ui_element) in text_query.iter_mut() {
-                if input.is_focused {
-                    match event.key_code {
-                        KeyCode::Backspace => {
-                            input.buffer.pop();
-                            text.sections[0].value = input.buffer.clone();
-                        }
-                        KeyCode::Enter => {
-                            if let Ok(value) = input.buffer.parse::<f32>() {
-                                // Update simulation parameters based on the UI element type
-                                match ui_element {
-                                    UIElement::CoherenceInput => sim_params.coherence = value,
-                                    UIElement::SeparationInput => sim_params.separation = value,
-                                    UIElement::AlignmentInput => sim_params.alignment = value,
-                                    UIElement::VisualRangeInput => sim_params.visual_range = value,
-                                    _ => {}
-                                }
-                            }
-                            input.is_focused = false;
-                        }
-                        // Handle numeric input and decimal point
-                        key_code => {
-                            if let Some(char) = key_code_to_char(key_code) {
-                                if char.is_ascii_digit() || char == '.' {
-                                    input.buffer.push(char);
-                                    text.sections[0].value = input.buffer.clone();
-                                }
-                            }
+                if !input.is_focused {
+                    continue;
+                }
+
+                // Create a state that we can modify without borrowing conflicts
+                let mut state = TextState {
+                    buffer: input.buffer.clone(),
+                    cursor_position: input.cursor_position,
+                    cursor_visible: true,
+                };
+
+                let mut handled = true;
+                match event.key_code {
+                    KeyCode::ArrowLeft => {
+                        if state.cursor_position > 0 {
+                            state.cursor_position -= 1;
                         }
                     }
+                    KeyCode::ArrowRight => {
+                        if state.cursor_position < state.buffer.len() {
+                            state.cursor_position += 1;
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if state.cursor_position > 0 {
+                            state.buffer.remove(state.cursor_position - 1);
+                            state.cursor_position -= 1;
+                        }
+                    }
+                    KeyCode::Delete => {
+                        if state.cursor_position < state.buffer.len() {
+                            state.buffer.remove(state.cursor_position);
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Ok(value) = state.buffer.parse::<f32>() {
+                            match ui_element {
+                                UIElement::CoherenceInput => sim_params.coherence = value,
+                                UIElement::SeparationInput => sim_params.separation = value,
+                                UIElement::AlignmentInput => sim_params.alignment = value,
+                                UIElement::VisualRangeInput => sim_params.visual_range = value,
+                                _ => {}
+                            }
+                        }
+                        state.cursor_visible = false;
+                        input.is_focused = false;
+                    }
+                    key_code => {
+                        if let Some(char) = key_code_to_char(key_code) {
+                            if char.is_ascii_digit() || char == '.' {
+                                state.buffer.insert(state.cursor_position, char);
+                                state.cursor_position += 1;
+                            }
+                        } else {
+                            handled = false;
+                        }
+                    }
+                }
+
+                if handled {
+                    update_text_state(&mut input, &mut text, state);
                 }
             }
         }
     }
 }
+
+fn update_cursor(
+    time: Res<Time>,
+    mut query: Query<(&mut TextInput, &mut Text)>,
+) {
+    for (mut input, mut text) in query.iter_mut() {
+        if input.is_focused {
+            input.cursor_timer.tick(time.delta());
+            
+            if input.cursor_timer.just_finished() {
+                input.cursor_visible = !input.cursor_visible;
+                
+                // Gather values before updating text
+                let buffer = input.buffer.clone();
+                let cursor_pos = input.cursor_position;
+                let show_cursor = input.cursor_visible && input.is_focused;
+                text.sections[0].value = update_text_display(&buffer, cursor_pos, show_cursor);
+            }
+        }
+    }
+}
+
 
 fn key_code_to_char(key_code: KeyCode) -> Option<char> {
     match key_code {
@@ -366,6 +447,32 @@ fn update_text_inputs(
             }
         }
     }
+}
+
+
+fn update_text_display(buffer: &str, cursor_position: usize, show_cursor: bool) -> String {
+    if show_cursor {
+        let mut display = buffer.to_string();
+        display.insert(cursor_position, '|');
+        display
+    } else {
+        buffer.to_string()
+    }
+}
+
+fn update_text_state(input: &mut TextInput, text: &mut Text, state: TextState) {
+    input.buffer = state.buffer.clone();
+    input.cursor_position = state.cursor_position;
+    input.cursor_visible = state.cursor_visible;
+    
+    // Update display text
+    text.sections[0].value = if input.is_focused && input.cursor_visible {
+        let mut display = input.buffer.clone();
+        display.insert(input.cursor_position, '|');
+        display
+    } else {
+        input.buffer.clone()
+    };
 }
 
 fn spawn_button(parent: &mut ChildBuilder, text: &str, ui_element: UIElement) {

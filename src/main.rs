@@ -28,10 +28,6 @@ struct SimulationParams {
 
 #[derive(Component)]
 enum UIElement {
-    CoherenceSlider,
-    SeparationSlider,
-    AlignmentSlider,
-    VisualRangeSlider,
     ResetButton,
     TracePathsButton,
 }
@@ -41,7 +37,7 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .insert_resource(SimulationParams {
             coherence: 0.05,
-            separation: 0.05,
+            separation: 0.1,
             alignment: 0.05,
             visual_range: 75.0,
             trace_paths: true,
@@ -50,7 +46,6 @@ fn main() {
         .add_systems(Update, (
             update_boids,
             move_boids,
-            update_sliders,
             handle_button_clicks,
             update_trails,
         ))
@@ -137,91 +132,10 @@ fn setup_ui(mut commands: Commands) {
                     ..default()
                 })
                 .with_children(|parent| {
-                    spawn_slider(parent, "Coherence", UIElement::CoherenceSlider);
-                    spawn_slider(parent, "Separation", UIElement::SeparationSlider);
-                    spawn_slider(parent, "Alignment", UIElement::AlignmentSlider);
-                    spawn_slider(parent, "Visual Range", UIElement::VisualRangeSlider);
                     spawn_button(parent, "Reset", UIElement::ResetButton);
                     spawn_button(parent, "Trace Paths", UIElement::TracePathsButton);
                 });
         });
-}
-
-
-fn spawn_slider(parent: &mut ChildBuilder, label: &str, ui_element: UIElement) {
-    parent
-        .spawn(NodeBundle {
-            style: Style {
-                flex_direction: FlexDirection::Column,
-                align_items: AlignItems::Center,
-                ..default()
-            },
-            ..default()
-        })
-        .with_children(|parent| {
-            parent.spawn(TextBundle::from_section(
-                label,
-                TextStyle {
-                    font_size: 16.0,
-                    color: Color::WHITE,
-                    ..default()
-                },
-            ));
-            parent
-                .spawn(NodeBundle {
-                    style: Style {
-                        width: Val::Px(200.0),
-                        height: Val::Px(20.0),
-                        ..default()
-                    },
-                    background_color: Color::srgb_u8(38, 38, 38).into(),
-                    ..default()
-                })
-                .with_children(|parent| {
-                    parent.spawn((
-                        NodeBundle {
-                            style: Style {
-                                width: Val::Percent(50.0),
-                                height: Val::Percent(100.0),
-                                ..default()
-                            },
-                            background_color: Color::srgb_u8(102, 102, 102).into(),
-                            ..default()
-                        },
-                        ui_element,
-                        Interaction::default(),
-                    ));
-                });
-        });
-}
-
-fn update_sliders(
-    mut interaction_query: Query<(&Interaction, &UIElement, &mut Style, &Node, &GlobalTransform), (Changed<Interaction>, With<UIElement>)>,
-    mut sim_params: ResMut<SimulationParams>,
-    q_window: Query<&Window>,
-) {
-    let window = q_window.single();
-    
-    for (interaction, ui_element, mut style, node, transform) in interaction_query.iter_mut() {
-        if let Interaction::Pressed = *interaction {
-            if let Some(cursor_position) = window.cursor_position() {
-                let node_width = node.size().x;
-                let relative_x = (cursor_position.x - transform.translation().x) / node_width;
-                let value = relative_x.clamp(0.0, 1.0);
-                
-                match ui_element {
-                    UIElement::CoherenceSlider => sim_params.coherence = value * 0.02,
-                    UIElement::SeparationSlider => sim_params.separation = value * 0.2,
-                    UIElement::AlignmentSlider => sim_params.alignment = value * 0.1,
-                    UIElement::VisualRangeSlider => sim_params.visual_range = value * 200.0,
-                    _ => {}
-                }
-                
-                // Update the slider handle width
-                style.width = Val::Percent(value * 100.0);
-            }
-        }
-    }
 }
 
 fn spawn_button(parent: &mut ChildBuilder, text: &str, ui_element: UIElement) {
@@ -277,7 +191,6 @@ fn handle_button_clicks(
                         }
                     }
                 }
-                _ => {}
             }
         }
     }

@@ -8,27 +8,26 @@ use rand::Rng;
 use noise::{NoiseFn, Perlin};
 use std::collections::HashMap;
 
-// Constants
+// ==================== Constants ====================
 const BOID_COUNT: usize = 2000;
 const BOID_SPEED_LIMIT: f32 = 300.0;
 const TRAIL_LENGTH: usize = 25;
 const GRID_CELL_SIZE: f32 = 60.0;
 
+// Noise generation constants
+const NOISE_SCALE: f32 = 0.1;
+const NOISE_STRENGTH: f32 = 100.0;
+const TIME_SCALE: f32 = 0.02;
 
-// Noise gen for random movement
-const NOISE_SCALE: f32 = 0.1;    // Adjusts how quickly the noise pattern changes.
-const NOISE_STRENGTH: f32 = 100.0;  // Adjusts how strong the random turning force is.
-const TIME_SCALE: f32 = 0.02;       // How quickly the noise pattern evolves over time
-
-// The Almighty Boid
+// ==================== Components ====================
 #[derive(Component)]
 struct Boid {
     velocity: Vec2,
     trail: Vec<Vec2>,
     noise_offset_x: f32,
     noise_offset_y: f32,
-    noise_offset_z: f32,    // For time-based variation.
-    noise_seed: f32,        // For per-boid variation.
+    noise_offset_z: f32,
+    noise_seed: f32,
 }
 
 #[derive(Component)]
@@ -36,49 +35,66 @@ struct GridPosition {
     cell: IVec2,
 }
 
+#[derive(Component)]
+struct GridCellText;
+
+#[derive(Component)]
+struct FpsText;
+
+#[derive(Component)]
+struct TextInput {
+    is_focused: bool,
+    buffer: String,
+    cursor_visible: bool,
+    cursor_timer: Timer,
+    cursor_position: usize,
+}
+
+// ==================== Resources ====================
 #[derive(Resource)]
 struct SpatialGrid {
     cells: HashMap<IVec2, Vec<Entity>>,
 }
 
+#[derive(Resource)]
+struct DebugConfig {
+    show_grid: bool,
+}
+
+#[derive(Resource)]
+struct SimulationParams {
+    coherence: f32,
+    separation: f32,
+    alignment: f32,
+    visual_range: f32,
+    trace_paths: bool,
+}
+
+// ==================== UI Elements ====================
+#[derive(Component)]
+enum UIElement {
+    CoherenceInput,
+    SeparationInput,
+    AlignmentInput,
+    VisualRangeInput,
+    ResetButton,
+    TracePathsButton,
+}
+
+#[derive(Clone)]
+struct TextState {
+    buffer: String,
+    cursor_position: usize,
+    cursor_visible: bool,
+}
+
+// ==================== Default Implementations ====================
 impl Default for SpatialGrid {
     fn default() -> Self {
         Self {
             cells: HashMap::new(),
         }
     }
-}
-
-impl SpatialGrid {
-    // Get nearby entities within the visual range
-    fn get_nearby_entities(&self, cell: IVec2) -> Vec<Entity> {
-        let mut nearby = Vec::new();
-        
-        // Check current cell and all adjacent cells
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                let neighbor_cell = cell + IVec2::new(dx, dy);
-                if let Some(entities) = self.cells.get(&neighbor_cell) {
-                    nearby.extend(entities);
-                }
-            }
-        }
-        
-        nearby
-    }
-    
-    // Convert world position to grid cell
-    fn world_to_cell(position: Vec2) -> IVec2 {
-        IVec2::new(
-            (position.x / GRID_CELL_SIZE).floor() as i32,
-            (position.y / GRID_CELL_SIZE).floor() as i32,
-        )
-    }
-}
-
-#[derive(Resource)]
-struct DebugConfig {
-    show_grid: bool,
 }
 
 impl Default for DebugConfig {
@@ -89,50 +105,29 @@ impl Default for DebugConfig {
     }
 }
 
-#[derive(Component)]
-struct GridCellText;
-
-// Parameters that influence the behaviour of the boids.
-#[derive(Resource)]
-struct SimulationParams {
-    coherence: f32,
-    separation: f32,
-    alignment: f32,
-    visual_range: f32,
-    trace_paths: bool,
+impl SpatialGrid {
+    fn get_nearby_entities(&self, cell: IVec2) -> Vec<Entity> {
+        let mut nearby = Vec::new();
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                let neighbor_cell = cell + IVec2::new(dx, dy);
+                if let Some(entities) = self.cells.get(&neighbor_cell) {
+                    nearby.extend(entities);
+                }
+            }
+        }
+        nearby
+    }
+    
+    fn world_to_cell(position: Vec2) -> IVec2 {
+        IVec2::new(
+            (position.x / GRID_CELL_SIZE).floor() as i32,
+            (position.y / GRID_CELL_SIZE).floor() as i32,
+        )
+    }
 }
 
-// User interface elements.
-#[derive(Component)]
-enum UIElement {
-    CoherenceInput,
-    SeparationInput,
-    AlignmentInput,
-    VisualRangeInput,
-    ResetButton,
-    TracePathsButton,
-}
-// FPS Counter
-#[derive(Component)]
-struct FpsText;
-
-// Text Input Fields
-#[derive(Component)]
-struct TextInput {
-    is_focused: bool,
-    buffer: String,
-    cursor_visible: bool,
-    cursor_timer: Timer,
-    cursor_position: usize,
-}
-
-#[derive(Clone)]
-struct TextState {
-    buffer: String,
-    cursor_position: usize,
-    cursor_visible: bool,
-}
-
+// ==================== Main App Setup ====================
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
@@ -147,20 +142,36 @@ fn main() {
         .insert_resource(DebugConfig::default())
         .add_systems(Startup, (setup, setup_ui))
         .add_systems(Update, (
+            // Grid systems
             update_spatial_grid,
             update_boids_with_grid,
+            draw_spatial_grid,
+            cleanup_grid_text,
+            toggle_grid_visibility,
+            
+            // Boid movement systems
             move_boids,
+            update_trails,
+            
+            // UI systems
             handle_text_input,
             update_fps_text,
             update_text_inputs,
             update_cursor,
             handle_button_clicks,
-            update_trails,
-            toggle_grid_visibility,
-            draw_spatial_grid,
-            cleanup_grid_text,   
         ))
         .run();
+}
+
+// ==================== Setup Systems ====================
+fn setup(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>
+) {
+    commands.spawn(Camera2dBundle::default());
+    commands.insert_resource(SpatialGrid::default());
+    spawn_boids(&mut commands, &mut meshes, &mut materials);
 }
 
 fn spawn_boids(
@@ -177,7 +188,6 @@ fn spawn_boids(
         let position = Vec2::new(rng.gen_range(-300.0..300.0), rng.gen_range(-300.0..300.0));
         let angle = velocity.y.atan2(velocity.x);
 
-        // Add GridPosition component during spawn
         commands.spawn((
             Boid {
                 velocity,
@@ -201,18 +211,6 @@ fn spawn_boids(
     }
 }
 
-
-fn setup(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut materials: ResMut<Assets<ColorMaterial>>) {
-    // Initialize the camera
-    commands.spawn(Camera2dBundle::default());
-    
-    // Initialize the spatial grid resource
-    commands.insert_resource(SpatialGrid::default());
-    
-    // Spawn boids
-    spawn_boids(&mut commands, &mut meshes, &mut materials);
-}
-
 fn reset_boids(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
@@ -224,12 +222,11 @@ fn reset_boids(
         commands.entity(entity).despawn();
     }
 
-    // Spawn new boids with grid positions
+    // Spawn new boids
     spawn_boids(commands, meshes, materials);
 }
 
-
-
+// ==================== UI Setup and Systems ====================
 fn setup_ui(mut commands: Commands) {
     commands
         .spawn(NodeBundle {
@@ -244,7 +241,7 @@ fn setup_ui(mut commands: Commands) {
             ..default()
         })
         .with_children(|parent| {
-            // Add FPS counter to the top left of the screen
+            // FPS Counter
             parent.spawn(NodeBundle {
                 style: Style {
                     position_type: PositionType::Absolute,
@@ -268,41 +265,29 @@ fn setup_ui(mut commands: Commands) {
                 ));
             });
 
+            // Control Panel
             parent.spawn(NodeBundle {
-                    style: Style {
-                        width: Val::Percent(100.0),
-                        height: Val::Px(100.0),
-                        flex_direction: FlexDirection::Row,
-                        align_items: AlignItems::Center,
-                        justify_content: JustifyContent::SpaceEvenly,
-                        padding: UiRect::all(Val::Px(10.0)),
-                        ..default()
-                    },
-                    background_color: Color::srgba(0.1, 0.1, 0.1, 0.5).into(),
+                style: Style {
+                    width: Val::Percent(100.0),
+                    height: Val::Px(100.0),
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    justify_content: JustifyContent::SpaceEvenly,
+                    padding: UiRect::all(Val::Px(10.0)),
                     ..default()
-                })
-                .with_children(|parent| {
-                    spawn_text_input(parent, "Coherence", "0.015", UIElement::CoherenceInput);      // Updated
-                    spawn_text_input(parent, "Separation", "0.25", UIElement::SeparationInput);     // Updated
-                    spawn_text_input(parent, "Alignment", "0.125", UIElement::AlignmentInput);      // Updated
-                    spawn_text_input(parent, "Visual Range", "60.0", UIElement::VisualRangeInput); // Updated
-                    spawn_button(parent, "Reset", UIElement::ResetButton);
-                    spawn_button(parent, "Trace Paths", UIElement::TracePathsButton);
-                });
+                },
+                background_color: Color::srgba(0.1, 0.1, 0.1, 0.5).into(),
+                ..default()
+            })
+            .with_children(|parent| {
+                spawn_text_input(parent, "Coherence", "0.015", UIElement::CoherenceInput);
+                spawn_text_input(parent, "Separation", "0.25", UIElement::SeparationInput);
+                spawn_text_input(parent, "Alignment", "0.125", UIElement::AlignmentInput);
+                spawn_text_input(parent, "Visual Range", "60.0", UIElement::VisualRangeInput);
+                spawn_button(parent, "Reset", UIElement::ResetButton);
+                spawn_button(parent, "Trace Paths", UIElement::TracePathsButton);
+            });
         });
-}
-
-fn update_fps_text(
-    diagnostics: Res<DiagnosticsStore>,
-    mut query: Query<&mut Text, With<FpsText>>,
-) {
-    if let Some(fps) = diagnostics.get(&FrameTimeDiagnosticsPlugin::FPS) {
-        if let Some(value) = fps.smoothed() {
-            for mut text in query.iter_mut() {
-                text.sections[0].value = format!("FPS: {:.1}", value);
-            }
-        }
-    }
 }
 
 fn spawn_text_input(parent: &mut ChildBuilder, label: &str, default_value: &str, ui_element: UIElement) {
@@ -358,13 +343,54 @@ fn spawn_text_input(parent: &mut ChildBuilder, label: &str, default_value: &str,
                     buffer: default_value.to_string(),
                     cursor_visible: true,
                     cursor_timer: Timer::from_seconds(0.5, TimerMode::Repeating),
-                    cursor_position: default_value.len(), // Start cursor at end of text
+                    cursor_position: default_value.len(),
                 },
                 Interaction::default(),
             ));
         });
 }
 
+fn spawn_button(parent: &mut ChildBuilder, text: &str, ui_element: UIElement) {
+    parent.spawn((
+        ButtonBundle {
+            style: Style {
+                width: Val::Px(150.0),
+                height: Val::Px(50.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            background_color: Color::srgb_u8(38, 38, 38).into(),
+            ..default()
+        },
+        ui_element,
+    ))
+    .with_children(|parent| {
+        parent.spawn(TextBundle::from_section(
+            text,
+            TextStyle {
+                font_size: 20.0,
+                color: Color::WHITE,
+                ..default()
+            },
+        ));
+    });
+}
+
+fn update_fps_text(
+    diagnostics: Res<DiagnosticsStore>,
+    mut query: Query<&mut Text, With<FpsText>>,
+) {
+    if let Some(fps) = diagnostics.get(&FrameTimeDiagnosticsPlugin::FPS) {
+        if let Some(value) = fps.smoothed() {
+            for mut text in query.iter_mut() {
+                text.sections[0].value = format!("FPS: {:.1}", value);
+            }
+        }
+    }
+}
+
+// ==================== Input Handling Systems ====================
 fn handle_text_input(
     mut text_query: Query<(&mut TextInput, &mut Text, &mut BackgroundColor, &Interaction, &UIElement)>,
     mut sim_params: ResMut<SimulationParams>,
@@ -378,7 +404,6 @@ fn handle_text_input(
             input.is_focused = matches!(interaction, Interaction::Pressed);
             
             if input.is_focused != was_focused {
-                // Create a separate state struct to avoid borrowing conflicts
                 let state = TextState {
                     buffer: input.buffer.clone(),
                     cursor_position: input.buffer.len(),
@@ -404,7 +429,6 @@ fn handle_text_input(
                     continue;
                 }
 
-                // Create a state that we can modify without borrowing conflicts
                 let mut state = TextState {
                     buffer: input.buffer.clone(),
                     cursor_position: input.cursor_position,
@@ -467,28 +491,6 @@ fn handle_text_input(
     }
 }
 
-fn update_cursor(
-    time: Res<Time>,
-    mut query: Query<(&mut TextInput, &mut Text)>,
-) {
-    for (mut input, mut text) in query.iter_mut() {
-        if input.is_focused {
-            input.cursor_timer.tick(time.delta());
-            
-            if input.cursor_timer.just_finished() {
-                input.cursor_visible = !input.cursor_visible;
-                
-                // Gather values before updating text
-                let buffer = input.buffer.clone();
-                let cursor_pos = input.cursor_position;
-                let show_cursor = input.cursor_visible && input.is_focused;
-                text.sections[0].value = update_text_display(&buffer, cursor_pos, show_cursor);
-            }
-        }
-    }
-}
-
-
 fn key_code_to_char(key_code: KeyCode) -> Option<char> {
     match key_code {
         KeyCode::Digit0 | KeyCode::Numpad0 => Some('0'),
@@ -506,30 +508,35 @@ fn key_code_to_char(key_code: KeyCode) -> Option<char> {
     }
 }
 
-fn update_text_inputs(
-    mut text_query: Query<(&mut Text, &UIElement, &Interaction), (Changed<Interaction>, With<UIElement>)>,
-    mut sim_params: ResMut<SimulationParams>,
-    keyboard: Res<ButtonInput<KeyCode>>,
+fn update_text_state(input: &mut TextInput, text: &mut Text, state: TextState) {
+    input.buffer = state.buffer.clone();
+    input.cursor_position = state.cursor_position;
+    input.cursor_visible = state.cursor_visible;
+    
+    text.sections[0].value = if input.is_focused && input.cursor_visible {
+        let mut display = input.buffer.clone();
+        display.insert(input.cursor_position, '|');
+        display
+    } else {
+        input.buffer.clone()
+    };
+}
+
+fn update_cursor(
+    time: Res<Time>,
+    mut query: Query<(&mut TextInput, &mut Text)>,
 ) {
-    for (text, ui_element, interaction) in text_query.iter_mut() {
-        if let Interaction::Pressed = *interaction {
-            // Handle text input focus if needed
-            continue;
-        }
-
-        // Only process if Enter is pressed
-        if !keyboard.just_pressed(KeyCode::Enter) {
-            continue;
-        }
-
-        let current_value = &text.sections[0].value;
-        if let Ok(value) = current_value.parse::<f32>() {
-            match ui_element {
-                UIElement::CoherenceInput => sim_params.coherence = value,
-                UIElement::SeparationInput => sim_params.separation = value,
-                UIElement::AlignmentInput => sim_params.alignment = value,
-                UIElement::VisualRangeInput => sim_params.visual_range = value,
-                _ => {}
+    for (mut input, mut text) in query.iter_mut() {
+        if input.is_focused {
+            input.cursor_timer.tick(time.delta());
+            
+            if input.cursor_timer.just_finished() {
+                input.cursor_visible = !input.cursor_visible;
+                
+                let buffer = input.buffer.clone();
+                let cursor_pos = input.cursor_position;
+                let show_cursor = input.cursor_visible && input.is_focused;
+                text.sections[0].value = update_text_display(&buffer, cursor_pos, show_cursor);
             }
         }
     }
@@ -544,49 +551,6 @@ fn update_text_display(buffer: &str, cursor_position: usize, show_cursor: bool) 
         buffer.to_string()
     }
 }
-
-fn update_text_state(input: &mut TextInput, text: &mut Text, state: TextState) {
-    input.buffer = state.buffer.clone();
-    input.cursor_position = state.cursor_position;
-    input.cursor_visible = state.cursor_visible;
-    
-    // Update display text
-    text.sections[0].value = if input.is_focused && input.cursor_visible {
-        let mut display = input.buffer.clone();
-        display.insert(input.cursor_position, '|');
-        display
-    } else {
-        input.buffer.clone()
-    };
-}
-
-fn spawn_button(parent: &mut ChildBuilder, text: &str, ui_element: UIElement) {
-    parent.spawn((
-        ButtonBundle {
-            style: Style {
-                width: Val::Px(150.0),
-                height: Val::Px(50.0),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                ..default()
-            },
-            background_color: Color::srgb_u8(38, 38, 38).into(),
-            ..default()
-        },
-        ui_element,
-    ))
-    .with_children(|parent| {
-        parent.spawn(TextBundle::from_section(
-            text,
-            TextStyle {
-                font_size: 20.0,
-                color: Color::WHITE,
-                ..default()
-            },
-        ));
-    });
-}
-
 
 fn handle_button_clicks(
     mut commands: Commands,
@@ -613,37 +577,150 @@ fn handle_button_clicks(
                         }
                     }
                 }
-                // Add catch-all for input elements since they don't need button click handling
-                UIElement::CoherenceInput | UIElement::SeparationInput | 
-                UIElement::AlignmentInput | UIElement::VisualRangeInput => {}
+                _ => {}
             }
         }
     }
 }
 
+// ==================== Grid Systems ====================
 fn update_spatial_grid(
     mut grid: ResMut<SpatialGrid>,
     query: Query<(Entity, &Transform, &GridPosition), With<Boid>>,
     mut commands: Commands,
 ) {
-    // Clear the previous grid
     grid.cells.clear();
     
-    // Update grid positions
     for (entity, transform, grid_pos) in query.iter() {
         let position = transform.translation.truncate();
         let new_cell = SpatialGrid::world_to_cell(position);
         
-        // If cell has changed, update the component
         if new_cell != grid_pos.cell {
             commands.entity(entity).insert(GridPosition { cell: new_cell });
         }
         
-        // Add entity to the grid
         grid.cells.entry(new_cell).or_default().push(entity);
     }
 }
 
+fn draw_spatial_grid(
+    mut commands: Commands,
+    mut gizmos: Gizmos,
+    grid: Res<SpatialGrid>,
+    debug_config: Res<DebugConfig>,
+    window_query: Query<&Window>,
+    text_query: Query<Entity, With<GridCellText>>,
+) {
+    for entity in text_query.iter() {
+        commands.entity(entity).despawn_recursive();
+    }
+
+    if !debug_config.show_grid {
+        return;
+    }
+
+    let window = window_query.single();
+    let width = window.width();
+    let height = window.height();
+    let half_width = width / 2.0;
+    let half_height = height / 2.0;
+
+    // Calculate grid boundaries
+    let start_cell_x = ((-half_width) / GRID_CELL_SIZE).floor() as i32;
+    let end_cell_x = ((half_width) / GRID_CELL_SIZE).ceil() as i32;
+    let start_cell_y = ((-half_height) / GRID_CELL_SIZE).floor() as i32;
+    let end_cell_y = ((half_height) / GRID_CELL_SIZE).ceil() as i32;
+
+    // Draw background grid
+    for x in start_cell_x..=end_cell_x {
+        for y in start_cell_y..=end_cell_y {
+            let cell_pos = Vec2::new(
+                x as f32 * GRID_CELL_SIZE,
+                y as f32 * GRID_CELL_SIZE
+            );
+            
+            gizmos.rect_2d(
+                cell_pos,
+                0.0,
+                Vec2::new(GRID_CELL_SIZE, GRID_CELL_SIZE),
+                Color::srgb(0.2, 0.2, 0.2).with_alpha(0.1),
+            );
+        }
+    }
+
+    // Draw occupied cells
+    for (&cell, entities) in grid.cells.iter() {
+        let cell_pos = Vec2::new(
+            cell.x as f32 * GRID_CELL_SIZE,
+            cell.y as f32 * GRID_CELL_SIZE
+        );
+
+        if cell_pos.x >= -half_width - GRID_CELL_SIZE && 
+           cell_pos.x <= half_width + GRID_CELL_SIZE &&
+           cell_pos.y >= -half_height - GRID_CELL_SIZE && 
+           cell_pos.y <= half_height + GRID_CELL_SIZE {
+            
+            let density = (entities.len() as f32) / (BOID_COUNT as f32);
+            let base_color = Color::srgba(1.0, 0.0, 0.0, density.min(0.5));
+            
+            gizmos.rect_2d(
+                cell_pos,
+                0.0,
+                Vec2::new(GRID_CELL_SIZE, GRID_CELL_SIZE),
+                base_color,
+            );
+
+            gizmos.rect_2d(
+                cell_pos,
+                0.0,
+                Vec2::new(GRID_CELL_SIZE, GRID_CELL_SIZE),
+                Color::WHITE.with_alpha(0.2),
+            );
+
+            if !entities.is_empty() {
+                commands.spawn((
+                    Text2dBundle {
+                        text: Text::from_section(
+                            entities.len().to_string(),
+                            TextStyle {
+                                font_size: 16.0,
+                                color: Color::WHITE,
+                                ..default()
+                            },
+                        ),
+                        transform: Transform::from_xyz(cell_pos.x, cell_pos.y, 1.0),
+                        text_anchor: Anchor::Center,
+                        ..default()
+                    },
+                    GridCellText,
+                ));
+            }
+        }
+    }
+}
+
+fn toggle_grid_visibility(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut debug_config: ResMut<DebugConfig>,
+) {
+    if keyboard.just_pressed(KeyCode::KeyG) {
+        debug_config.show_grid = !debug_config.show_grid;
+    }
+}
+
+fn cleanup_grid_text(
+    mut commands: Commands,
+    text_query: Query<Entity, With<GridCellText>>,
+    debug_config: Res<DebugConfig>,
+) {
+    if !debug_config.show_grid {
+        for entity in text_query.iter() {
+            commands.entity(entity).despawn_recursive();
+        }
+    }
+}
+
+// ==================== Boid Movement Systems ====================
 fn update_boids_with_grid(
     mut query: Query<(Entity, &mut Transform, &mut Boid, &GridPosition)>,
     grid: Res<SpatialGrid>,
@@ -658,7 +735,6 @@ fn update_boids_with_grid(
     let perlin = Perlin::new(1);
     let current_time = time.elapsed_seconds() * TIME_SCALE;
     
-    // Store positions and velocities for current frame
     let boids_data: HashMap<Entity, (Vec2, Vec2)> = query
         .iter()
         .map(|(entity, transform, boid, _)| {
@@ -668,8 +744,6 @@ fn update_boids_with_grid(
     
     for (entity, mut transform, mut boid, grid_pos) in query.iter_mut() {
         let mut position = transform.translation.truncate();
-        
-        // Get nearby boids using spatial grid
         let nearby_entities = grid.get_nearby_entities(grid_pos.cell);
         
         let mut center_of_mass = Vec2::ZERO;
@@ -677,7 +751,6 @@ fn update_boids_with_grid(
         let mut average_velocity = Vec2::ZERO;
         let mut num_neighbors = 0;
         
-        // Process only nearby boids
         for &other_entity in &nearby_entities {
             if other_entity == entity {
                 continue;
@@ -688,17 +761,13 @@ fn update_boids_with_grid(
                 let distance = diff.length();
                 
                 if distance < params.visual_range && distance > 0.0 {
-                    // Coherence
                     center_of_mass += *other_pos;
                     
-                    // Separation
                     if distance < params.visual_range / 2.0 {
                         avoid_vector -= diff.normalize() * (params.visual_range / (2.0 * distance.max(0.1)));
                     }
                     
-                    // Alignment
                     average_velocity += *other_vel;
-                    
                     num_neighbors += 1;
                 }
             }
@@ -715,6 +784,7 @@ fn update_boids_with_grid(
             boid.velocity += coherence + separation + alignment;
         }
         
+        // Update noise offsets
         boid.noise_offset_x += NOISE_SCALE * time.delta_seconds();
         boid.noise_offset_y += NOISE_SCALE * time.delta_seconds();
         boid.noise_offset_z = current_time;
@@ -743,16 +813,12 @@ fn update_boids_with_grid(
             boid.velocity = boid.velocity.normalize() * BOID_SPEED_LIMIT;
         }
         
-        // Position update and wrapping
-        let delta_time = time.delta_seconds();
-        position += boid.velocity * delta_time;
-        
+        // Update position and rotation
+        position += boid.velocity * time.delta_seconds();
         position.x = (position.x + width) % width - width / 2.0;
         position.y = (position.y + height) % height - height / 2.0;
-        
         transform.translation = position.extend(transform.translation.z);
         
-        // Update rotation
         if boid.velocity.length_squared() > 0.0 {
             let angle = boid.velocity.y.atan2(boid.velocity.x);
             transform.rotation = Quat::from_rotation_z(angle - std::f32::consts::FRAC_PI_2);
@@ -760,134 +826,6 @@ fn update_boids_with_grid(
     }
 }
 
-fn draw_spatial_grid(
-    mut commands: Commands,
-    mut gizmos: Gizmos,
-    grid: Res<SpatialGrid>,
-    debug_config: Res<DebugConfig>,
-    window_query: Query<&Window>,
-    text_query: Query<Entity, With<GridCellText>>,
-) {
-    // First, clean up all existing text entities that still exist
-    for entity in text_query.iter() {
-        commands.entity(entity).despawn_recursive();
-    }
-
-    if !debug_config.show_grid {
-        return;
-    }
-
-    let window = window_query.single();
-    let width = window.width();
-    let height = window.height();
-
-    // Calculate visible area in world coordinates
-    let half_width = width / 2.0;
-    let half_height = height / 2.0;
-
-    // Calculate grid start and end points
-    let start_cell_x = ((-half_width) / GRID_CELL_SIZE).floor() as i32;
-    let end_cell_x = ((half_width) / GRID_CELL_SIZE).ceil() as i32;
-    let start_cell_y = ((-half_height) / GRID_CELL_SIZE).floor() as i32;
-    let end_cell_y = ((half_height) / GRID_CELL_SIZE).ceil() as i32;
-
-    // Draw background grid
-    for x in start_cell_x..=end_cell_x {
-        for y in start_cell_y..=end_cell_y {
-            let cell_pos = Vec2::new(
-                x as f32 * GRID_CELL_SIZE,
-                y as f32 * GRID_CELL_SIZE
-            );
-            
-            // Draw faint grid for empty cells
-            gizmos.rect_2d(
-                cell_pos,
-                0.0,
-                Vec2::new(GRID_CELL_SIZE, GRID_CELL_SIZE),
-                Color::srgb(0.2, 0.2, 0.2).with_alpha(0.1),
-            );
-        }
-    }
-
-    // Draw occupied grid cells
-    for (&cell, entities) in grid.cells.iter() {
-        let cell_pos = Vec2::new(
-            cell.x as f32 * GRID_CELL_SIZE,
-            cell.y as f32 * GRID_CELL_SIZE
-        );
-
-        // Only draw if cell is in visible area
-        if cell_pos.x >= -half_width - GRID_CELL_SIZE && 
-           cell_pos.x <= half_width + GRID_CELL_SIZE &&
-           cell_pos.y >= -half_height - GRID_CELL_SIZE && 
-           cell_pos.y <= half_height + GRID_CELL_SIZE {
-            
-            // Calculate cell color based on boid density
-            let density = (entities.len() as f32) / (BOID_COUNT as f32);
-            let base_color = Color::srgba(1.0, 0.0, 0.0, density.min(0.5));
-            
-            // Draw filled cell
-            gizmos.rect_2d(
-                cell_pos,
-                0.0,
-                Vec2::new(GRID_CELL_SIZE, GRID_CELL_SIZE),
-                base_color,
-            );
-
-            // Draw cell outline
-            gizmos.rect_2d(
-                cell_pos,
-                0.0,
-                Vec2::new(GRID_CELL_SIZE, GRID_CELL_SIZE),
-                Color::WHITE.with_alpha(0.2),
-            );
-
-            // Spawn text showing number of boids in cell
-            if entities.len() > 0 {
-                commands.spawn((
-                    Text2dBundle {
-                        text: Text::from_section(
-                            entities.len().to_string(),
-                            TextStyle {
-                                font_size: 16.0,
-                                color: Color::WHITE,
-                                ..default()
-                            },
-                        ),
-                        transform: Transform::from_xyz(cell_pos.x, cell_pos.y, 1.0),
-                        text_anchor: Anchor::Center,
-                        ..default()
-                    },
-                    GridCellText,
-                ));
-            }
-        }
-    }
-}
-
-fn toggle_grid_visibility(
-    keyboard: Res<ButtonInput<KeyCode>>,
-    mut debug_config: ResMut<DebugConfig>,
-) {
-    if keyboard.just_pressed(KeyCode::KeyG) {
-        debug_config.show_grid = !debug_config.show_grid;
-        println!("Grid visibility: {}", if debug_config.show_grid { "on" } else { "off" }); // Optional debug print
-    }
-}
-
-// System to cleanup old text when toggling grid visibility
-fn cleanup_grid_text(
-    mut commands: Commands,
-    text_query: Query<Entity, With<GridCellText>>,
-    debug_config: Res<DebugConfig>,
-) {
-    if !debug_config.show_grid {
-        // Only attempt to despawn entities that still exist
-        for entity in text_query.iter() {
-            commands.entity(entity).despawn_recursive();
-        }
-    }
-}
 fn move_boids(
     mut query: Query<(&mut Transform, &mut Boid)>,
     time: Res<Time>,
@@ -919,7 +857,12 @@ fn move_boids(
     }
 }
 
-fn update_trails(mut gizmos: Gizmos, query: Query<&Boid>, sim_params: Res<SimulationParams>, window_query: Query<&Window>) {
+fn update_trails(
+    mut gizmos: Gizmos,
+    query: Query<&Boid>,
+    sim_params: Res<SimulationParams>,
+    window_query: Query<&Window>
+) {
     if sim_params.trace_paths {
         let window = window_query.single();
         let width = window.width();
@@ -937,13 +880,46 @@ fn update_trails(mut gizmos: Gizmos, query: Query<&Boid>, sim_params: Res<Simula
                         (end.y + height) % height - height / 2.0,
                     );
 
-                    // Check if the line crosses the screen edge
-                    if (start_wrapped - end_wrapped).length() > width / 2.0 || (start_wrapped - end_wrapped).length() > height / 2.0 {
-                        continue; // Skip drawing this line segment
+                    // Skip drawing lines that cross screen edges
+                    if (start_wrapped - end_wrapped).length() > width / 2.0 || 
+                       (start_wrapped - end_wrapped).length() > height / 2.0 {
+                        continue;
                     }
 
-                    gizmos.line_2d(start_wrapped, end_wrapped, Color::srgba(0.33, 0.55, 0.95, 0.1));
+                    gizmos.line_2d(
+                        start_wrapped,
+                        end_wrapped,
+                        Color::srgba(0.33, 0.55, 0.95, 0.1)
+                    );
                 }
+            }
+        }
+    }
+}
+
+// ==================== Helper Functions ====================
+fn update_text_inputs(
+    mut text_query: Query<(&mut Text, &UIElement, &Interaction), (Changed<Interaction>, With<UIElement>)>,
+    mut sim_params: ResMut<SimulationParams>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+) {
+    for (text, ui_element, interaction) in text_query.iter_mut() {
+        if let Interaction::Pressed = *interaction {
+            continue;
+        }
+
+        if !keyboard.just_pressed(KeyCode::Enter) {
+            continue;
+        }
+
+        let current_value = &text.sections[0].value;
+        if let Ok(value) = current_value.parse::<f32>() {
+            match ui_element {
+                UIElement::CoherenceInput => sim_params.coherence = value,
+                UIElement::SeparationInput => sim_params.separation = value,
+                UIElement::AlignmentInput => sim_params.alignment = value,
+                UIElement::VisualRangeInput => sim_params.visual_range = value,
+                _ => {}
             }
         }
     }

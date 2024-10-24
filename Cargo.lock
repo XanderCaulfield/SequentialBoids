@@ -311,6 +311,7 @@ dependencies = [
  "bevy",
  "noise",
  "rand",
+ "rand_chacha",
 ]
 
 [[package]]

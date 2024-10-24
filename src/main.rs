@@ -3,14 +3,16 @@ use bevy::time::{Timer, TimerMode};
 use bevy::input::keyboard::KeyboardInput;
 use bevy::input::ButtonState;
 use bevy::prelude::*;
-use bevy::sprite::MaterialMesh2dBundle;
+use bevy::sprite::{Anchor, MaterialMesh2dBundle};
 use rand::Rng;
 use noise::{NoiseFn, Perlin};
+use std::collections::HashMap;
 
 // Constants
 const BOID_COUNT: usize = 2000;
 const BOID_SPEED_LIMIT: f32 = 300.0;
 const TRAIL_LENGTH: usize = 25;
+const GRID_CELL_SIZE: f32 = 60.0;
 
 
 // Noise gen for random movement
@@ -28,6 +30,67 @@ struct Boid {
     noise_offset_z: f32,    // For time-based variation.
     noise_seed: f32,        // For per-boid variation.
 }
+
+#[derive(Component)]
+struct GridPosition {
+    cell: IVec2,
+}
+
+#[derive(Resource)]
+struct SpatialGrid {
+    cells: HashMap<IVec2, Vec<Entity>>,
+}
+
+impl Default for SpatialGrid {
+    fn default() -> Self {
+        Self {
+            cells: HashMap::new(),
+        }
+    }
+}
+
+impl SpatialGrid {
+    // Get nearby entities within the visual range
+    fn get_nearby_entities(&self, cell: IVec2) -> Vec<Entity> {
+        let mut nearby = Vec::new();
+        
+        // Check current cell and all adjacent cells
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                let neighbor_cell = cell + IVec2::new(dx, dy);
+                if let Some(entities) = self.cells.get(&neighbor_cell) {
+                    nearby.extend(entities);
+                }
+            }
+        }
+        
+        nearby
+    }
+    
+    // Convert world position to grid cell
+    fn world_to_cell(position: Vec2) -> IVec2 {
+        IVec2::new(
+            (position.x / GRID_CELL_SIZE).floor() as i32,
+            (position.y / GRID_CELL_SIZE).floor() as i32,
+        )
+    }
+}
+
+#[derive(Resource)]
+struct DebugConfig {
+    show_grid: bool,
+}
+
+impl Default for DebugConfig {
+    fn default() -> Self {
+        Self {
+            show_grid: false,
+        }
+    }
+}
+
+#[derive(Component)]
+struct GridCellText;
 
 // Parameters that influence the behaviour of the boids.
 #[derive(Resource)]
@@ -75,15 +138,17 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .insert_resource(SimulationParams {
-            coherence: 0.015,      // Match UI value
-            separation: 0.25,      // Match UI value
-            alignment: 0.125,      // Match UI value
-            visual_range: 75.0,    // Match UI value
+            coherence: 0.015,
+            separation: 0.25,
+            alignment: 0.125,
+            visual_range: 60.0,
             trace_paths: false,
         })
+        .insert_resource(DebugConfig::default())
         .add_systems(Startup, (setup, setup_ui))
         .add_systems(Update, (
-            update_boids,
+            update_spatial_grid,
+            update_boids_with_grid,
             move_boids,
             handle_text_input,
             update_fps_text,
@@ -91,6 +156,9 @@ fn main() {
             update_cursor,
             handle_button_clicks,
             update_trails,
+            toggle_grid_visibility,
+            draw_spatial_grid,
+            cleanup_grid_text,   
         ))
         .run();
 }
@@ -109,6 +177,7 @@ fn spawn_boids(
         let position = Vec2::new(rng.gen_range(-300.0..300.0), rng.gen_range(-300.0..300.0));
         let angle = velocity.y.atan2(velocity.x);
 
+        // Add GridPosition component during spawn
         commands.spawn((
             Boid {
                 velocity,
@@ -125,13 +194,22 @@ fn spawn_boids(
                     .with_rotation(Quat::from_rotation_z(angle - std::f32::consts::FRAC_PI_2)),
                 ..default()
             },
+            GridPosition {
+                cell: SpatialGrid::world_to_cell(Vec2::new(position.x, position.y)),
+            },
         ));
     }
 }
 
 
 fn setup(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut materials: ResMut<Assets<ColorMaterial>>) {
+    // Initialize the camera
     commands.spawn(Camera2dBundle::default());
+    
+    // Initialize the spatial grid resource
+    commands.insert_resource(SpatialGrid::default());
+    
+    // Spawn boids
     spawn_boids(&mut commands, &mut meshes, &mut materials);
 }
 
@@ -146,9 +224,10 @@ fn reset_boids(
         commands.entity(entity).despawn();
     }
 
-    // Spawn new boids
+    // Spawn new boids with grid positions
     spawn_boids(commands, meshes, materials);
 }
+
 
 
 fn setup_ui(mut commands: Commands) {
@@ -206,7 +285,7 @@ fn setup_ui(mut commands: Commands) {
                     spawn_text_input(parent, "Coherence", "0.015", UIElement::CoherenceInput);      // Updated
                     spawn_text_input(parent, "Separation", "0.25", UIElement::SeparationInput);     // Updated
                     spawn_text_input(parent, "Alignment", "0.125", UIElement::AlignmentInput);      // Updated
-                    spawn_text_input(parent, "Visual Range", "75.0", UIElement::VisualRangeInput); // Updated
+                    spawn_text_input(parent, "Visual Range", "60.0", UIElement::VisualRangeInput); // Updated
                     spawn_button(parent, "Reset", UIElement::ResetButton);
                     spawn_button(parent, "Trace Paths", UIElement::TracePathsButton);
                 });
@@ -456,7 +535,6 @@ fn update_text_inputs(
     }
 }
 
-
 fn update_text_display(buffer: &str, cursor_position: usize, show_cursor: bool) -> String {
     if show_cursor {
         let mut display = buffer.to_string();
@@ -543,8 +621,32 @@ fn handle_button_clicks(
     }
 }
 
-fn update_boids(
-    mut query: Query<(&mut Transform, &mut Boid)>,
+fn update_spatial_grid(
+    mut grid: ResMut<SpatialGrid>,
+    query: Query<(Entity, &Transform, &GridPosition), With<Boid>>,
+    mut commands: Commands,
+) {
+    // Clear the previous grid
+    grid.cells.clear();
+    
+    // Update grid positions
+    for (entity, transform, grid_pos) in query.iter() {
+        let position = transform.translation.truncate();
+        let new_cell = SpatialGrid::world_to_cell(position);
+        
+        // If cell has changed, update the component
+        if new_cell != grid_pos.cell {
+            commands.entity(entity).insert(GridPosition { cell: new_cell });
+        }
+        
+        // Add entity to the grid
+        grid.cells.entry(new_cell).or_default().push(entity);
+    }
+}
+
+fn update_boids_with_grid(
+    mut query: Query<(Entity, &mut Transform, &mut Boid, &GridPosition)>,
+    grid: Res<SpatialGrid>,
     params: Res<SimulationParams>,
     window_query: Query<&Window>,
     time: Res<Time>,
@@ -555,54 +657,64 @@ fn update_boids(
     
     let perlin = Perlin::new(1);
     let current_time = time.elapsed_seconds() * TIME_SCALE;
-
-    let boids: Vec<(Vec2, Vec2)> = query
+    
+    // Store positions and velocities for current frame
+    let boids_data: HashMap<Entity, (Vec2, Vec2)> = query
         .iter()
-        .map(|(transform, boid)| (transform.translation.truncate(), boid.velocity))
+        .map(|(entity, transform, boid, _)| {
+            (entity, (transform.translation.truncate(), boid.velocity))
+        })
         .collect();
-
-    for (mut transform, mut boid) in query.iter_mut() {
+    
+    for (entity, mut transform, mut boid, grid_pos) in query.iter_mut() {
         let mut position = transform.translation.truncate();
-
-        // Main flocking behavior
+        
+        // Get nearby boids using spatial grid
+        let nearby_entities = grid.get_nearby_entities(grid_pos.cell);
+        
         let mut center_of_mass = Vec2::ZERO;
         let mut avoid_vector = Vec2::ZERO;
         let mut average_velocity = Vec2::ZERO;
         let mut num_neighbors = 0;
-
-        for (other_pos, other_vel) in &boids {
-            let diff = *other_pos - position;
-            let distance = diff.length();
-
-            if distance < params.visual_range && distance > 0.0 {
-                // Coherence
-                center_of_mass += *other_pos;
-
-                // Separation (increased effect for closer boids)
-                if distance < params.visual_range / 2.0 {
-                    avoid_vector -= diff.normalize() * (params.visual_range / (2.0 * distance.max(0.1)));
+        
+        // Process only nearby boids
+        for &other_entity in &nearby_entities {
+            if other_entity == entity {
+                continue;
+            }
+            
+            if let Some((other_pos, other_vel)) = boids_data.get(&other_entity) {
+                let diff = *other_pos - position;
+                let distance = diff.length();
+                
+                if distance < params.visual_range && distance > 0.0 {
+                    // Coherence
+                    center_of_mass += *other_pos;
+                    
+                    // Separation
+                    if distance < params.visual_range / 2.0 {
+                        avoid_vector -= diff.normalize() * (params.visual_range / (2.0 * distance.max(0.1)));
+                    }
+                    
+                    // Alignment
+                    average_velocity += *other_vel;
+                    
+                    num_neighbors += 1;
                 }
-
-                // Alignment
-                average_velocity += *other_vel;
-
-                num_neighbors += 1;
             }
         }
-
-        // Calculate and apply flocking forces
+        
         if num_neighbors > 0 {
             center_of_mass /= num_neighbors as f32;
             average_velocity /= num_neighbors as f32;
-
+            
             let coherence = (center_of_mass - position) * params.coherence;
             let separation = avoid_vector * params.separation;
             let alignment = (average_velocity - boid.velocity) * params.alignment;
-
+            
             boid.velocity += coherence + separation + alignment;
         }
-
-        // Add very subtle random variation
+        
         boid.noise_offset_x += NOISE_SCALE * time.delta_seconds();
         boid.noise_offset_y += NOISE_SCALE * time.delta_seconds();
         boid.noise_offset_z = current_time;
@@ -614,7 +726,6 @@ fn update_boids(
             boid.noise_seed as f64,
         ]) as f32;
         
-        // Apply tiny steering adjustment
         let turn_angle = noise_value * NOISE_STRENGTH * time.delta_seconds();
         let (sin, cos) = turn_angle.sin_cos();
         let slight_adjustment = Vec2::new(
@@ -622,28 +733,26 @@ fn update_boids(
             boid.velocity.x * sin + boid.velocity.y * cos
         ).normalize();
         
-        // Apply very subtle adjustment to velocity
         boid.velocity = boid.velocity.lerp(slight_adjustment * boid.velocity.length(), 0.01);
-
-        // Maintain speed
+        
+        // Speed limiting
         let current_speed = boid.velocity.length();
         if current_speed < BOID_SPEED_LIMIT / 2.0 {
             boid.velocity = boid.velocity.normalize() * (BOID_SPEED_LIMIT / 2.0);
         } else if current_speed > BOID_SPEED_LIMIT {
             boid.velocity = boid.velocity.normalize() * BOID_SPEED_LIMIT;
         }
-
-        // Update position
+        
+        // Position update and wrapping
         let delta_time = time.delta_seconds();
         position += boid.velocity * delta_time;
-
-        // Wrap around screen edges
+        
         position.x = (position.x + width) % width - width / 2.0;
         position.y = (position.y + height) % height - height / 2.0;
-
+        
         transform.translation = position.extend(transform.translation.z);
-
-        // Update rotation to face velocity direction
+        
+        // Update rotation
         if boid.velocity.length_squared() > 0.0 {
             let angle = boid.velocity.y.atan2(boid.velocity.x);
             transform.rotation = Quat::from_rotation_z(angle - std::f32::consts::FRAC_PI_2);
@@ -651,6 +760,134 @@ fn update_boids(
     }
 }
 
+fn draw_spatial_grid(
+    mut commands: Commands,
+    mut gizmos: Gizmos,
+    grid: Res<SpatialGrid>,
+    debug_config: Res<DebugConfig>,
+    window_query: Query<&Window>,
+    text_query: Query<Entity, With<GridCellText>>,
+) {
+    // First, clean up all existing text entities that still exist
+    for entity in text_query.iter() {
+        commands.entity(entity).despawn_recursive();
+    }
+
+    if !debug_config.show_grid {
+        return;
+    }
+
+    let window = window_query.single();
+    let width = window.width();
+    let height = window.height();
+
+    // Calculate visible area in world coordinates
+    let half_width = width / 2.0;
+    let half_height = height / 2.0;
+
+    // Calculate grid start and end points
+    let start_cell_x = ((-half_width) / GRID_CELL_SIZE).floor() as i32;
+    let end_cell_x = ((half_width) / GRID_CELL_SIZE).ceil() as i32;
+    let start_cell_y = ((-half_height) / GRID_CELL_SIZE).floor() as i32;
+    let end_cell_y = ((half_height) / GRID_CELL_SIZE).ceil() as i32;
+
+    // Draw background grid
+    for x in start_cell_x..=end_cell_x {
+        for y in start_cell_y..=end_cell_y {
+            let cell_pos = Vec2::new(
+                x as f32 * GRID_CELL_SIZE,
+                y as f32 * GRID_CELL_SIZE
+            );
+            
+            // Draw faint grid for empty cells
+            gizmos.rect_2d(
+                cell_pos,
+                0.0,
+                Vec2::new(GRID_CELL_SIZE, GRID_CELL_SIZE),
+                Color::srgb(0.2, 0.2, 0.2).with_alpha(0.1),
+            );
+        }
+    }
+
+    // Draw occupied grid cells
+    for (&cell, entities) in grid.cells.iter() {
+        let cell_pos = Vec2::new(
+            cell.x as f32 * GRID_CELL_SIZE,
+            cell.y as f32 * GRID_CELL_SIZE
+        );
+
+        // Only draw if cell is in visible area
+        if cell_pos.x >= -half_width - GRID_CELL_SIZE && 
+           cell_pos.x <= half_width + GRID_CELL_SIZE &&
+           cell_pos.y >= -half_height - GRID_CELL_SIZE && 
+           cell_pos.y <= half_height + GRID_CELL_SIZE {
+            
+            // Calculate cell color based on boid density
+            let density = (entities.len() as f32) / (BOID_COUNT as f32);
+            let base_color = Color::srgba(1.0, 0.0, 0.0, density.min(0.5));
+            
+            // Draw filled cell
+            gizmos.rect_2d(
+                cell_pos,
+                0.0,
+                Vec2::new(GRID_CELL_SIZE, GRID_CELL_SIZE),
+                base_color,
+            );
+
+            // Draw cell outline
+            gizmos.rect_2d(
+                cell_pos,
+                0.0,
+                Vec2::new(GRID_CELL_SIZE, GRID_CELL_SIZE),
+                Color::WHITE.with_alpha(0.2),
+            );
+
+            // Spawn text showing number of boids in cell
+            if entities.len() > 0 {
+                commands.spawn((
+                    Text2dBundle {
+                        text: Text::from_section(
+                            entities.len().to_string(),
+                            TextStyle {
+                                font_size: 16.0,
+                                color: Color::WHITE,
+                                ..default()
+                            },
+                        ),
+                        transform: Transform::from_xyz(cell_pos.x, cell_pos.y, 1.0),
+                        text_anchor: Anchor::Center,
+                        ..default()
+                    },
+                    GridCellText,
+                ));
+            }
+        }
+    }
+}
+
+fn toggle_grid_visibility(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut debug_config: ResMut<DebugConfig>,
+) {
+    if keyboard.just_pressed(KeyCode::KeyG) {
+        debug_config.show_grid = !debug_config.show_grid;
+        println!("Grid visibility: {}", if debug_config.show_grid { "on" } else { "off" }); // Optional debug print
+    }
+}
+
+// System to cleanup old text when toggling grid visibility
+fn cleanup_grid_text(
+    mut commands: Commands,
+    text_query: Query<Entity, With<GridCellText>>,
+    debug_config: Res<DebugConfig>,
+) {
+    if !debug_config.show_grid {
+        // Only attempt to despawn entities that still exist
+        for entity in text_query.iter() {
+            commands.entity(entity).despawn_recursive();
+        }
+    }
+}
 fn move_boids(
     mut query: Query<(&mut Transform, &mut Boid)>,
     time: Res<Time>,

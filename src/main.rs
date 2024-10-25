@@ -1,4 +1,5 @@
 use bevy::{
+    app::AppExit,
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     prelude::*,
     sprite::{Anchor, MaterialMesh2dBundle},
@@ -7,7 +8,7 @@ use bevy::{
         keyboard::KeyboardInput,
         ButtonState,
     },
-    app::AppExit,
+    
 };
 use clap::Command;
 use noise::{NoiseFn, Perlin};
@@ -128,6 +129,12 @@ pub struct DebugConfig {
     show_grid: bool,
 }
 
+// Used to prevent overlapping logging in console output
+#[derive(Resource)]
+struct LoggingState {
+    is_logging: bool,
+}
+
 /// Deterministic random number generator using ChaCha8
 /// This ensures consistent behavior across runs with the same seed
 #[derive(Resource)]
@@ -229,6 +236,11 @@ pub enum ValidationMode {
     Disabled,     // Validation disabled
 }
 
+#[derive(SystemSet, Debug, Hash, PartialEq, Eq, Clone)]
+    enum TimingSet {
+        FrameTiming,
+    }
+
 // ===============================================================
 // ==================== Serialization Helpers ====================
 // ===============================================================
@@ -287,7 +299,7 @@ mod duration_serde {
 // =================================================================
 
 impl DeterminismValidator {
-    pub fn new(config: &SimulationConfig) -> Self {
+    pub fn from_config(config: &SimulationConfig) -> Self {
         let validation_mode = match config.mode {
             SimulationMode::Validate => ValidationMode::Validating,
             SimulationMode::Record => ValidationMode::Recording,
@@ -295,11 +307,17 @@ impl DeterminismValidator {
         };
 
         let parameter_schedule = if let Some(ref path) = config.parameter_schedule_path {
-            Self::load_parameter_schedule(path)
-                .unwrap_or_else(|e| {
-                    warn!("Failed to load parameter schedule: {}", e);
-                    Vec::new()
-                })
+            // First check if the file exists
+            if !path.exists() {
+                error!("Parameter schedule file not found: {}", path.display());
+                Vec::new()
+            } else {
+                Self::load_parameter_schedule(path)
+                    .unwrap_or_else(|e| {
+                        error!("Failed to load parameter schedule: {}", e);
+                        Vec::new()
+                    })
+            }
         } else {
             Vec::new()
         };
@@ -314,27 +332,58 @@ impl DeterminismValidator {
 
     pub fn validate_state(&self, step: u64, current_states: &[BoidState], params: &SimulationParams) -> bool {
         if let Some(snapshot) = self.snapshots.iter().find(|s| s.step == step) {
-            // Validate parameters first
+            let mut all_valid = true;
+            
+            // 1. Validate parameters
             if !self.validate_parameters(&snapshot.parameters, params) {
-                error!("Parameter mismatch at step {}", step);
-                return false;
+                error!("Parameter mismatch at step {}:", step);
+                error!("  Expected: Coherence={}, Separation={}, Alignment={}, VisualRange={}", 
+                    snapshot.parameters.coherence,
+                    snapshot.parameters.separation,
+                    snapshot.parameters.alignment,
+                    snapshot.parameters.visual_range);
+                error!("  Actual:   Coherence={}, Separation={}, Alignment={}, VisualRange={}", 
+                    params.coherence,
+                    params.separation,
+                    params.alignment,
+                    params.visual_range);
+                all_valid = false;
             }
 
-            // Then validate boid states
+            // 2. Validate boid count
             if snapshot.boid_states.len() != current_states.len() {
                 error!("Boid count mismatch at step {}", step);
-                return false;
+                error!("  Expected: {} boids", snapshot.boid_states.len());
+                error!("  Actual:   {} boids", current_states.len());
+                all_valid = false;
             }
 
-            for (expected, actual) in snapshot.boid_states.iter().zip(current_states.iter()) {
+            // 3. Validate individual boid states
+            for (i, (expected, actual)) in snapshot.boid_states.iter().zip(current_states.iter()).enumerate() {
                 if !self.validate_boid_state(expected, actual) {
-                    error!("Boid state mismatch at step {}", step);
-                    return false;
+                    error!("Boid {} state mismatch at step {}:", i, step);
+                    error!("  Expected: pos={:?}, vel={:?}", expected.position, expected.velocity);
+                    error!("  Actual:   pos={:?}, vel={:?}", actual.position, actual.velocity);
+                    all_valid = false;
+                    // Break after first few mismatches to avoid console spam
+                    if i > 5 {
+                        error!("... and more mismatches (truncated)");
+                        break;
+                    }
                 }
             }
-            true
+
+            if all_valid {
+                // Only log validation success periodically to avoid spam
+                if step % 1000 == 0 {
+                    info!("✓ Validation passed for step {}", step);
+                }
+            }
+
+            all_valid
         } else {
-            true // No reference data for this step
+            // No reference data for this step is fine
+            true
         }
     }
 
@@ -367,14 +416,28 @@ impl DeterminismValidator {
     }
 
     fn load_parameter_schedule(path: &Path) -> Result<Vec<ParameterChange>, Box<dyn Error>> {
-        let file = File::open(path)?;
-        Ok(serde_json::from_reader(file)?)
+        let file = File::open(path).map_err(|e| {
+            format!("Failed to open parameter schedule file '{}': {}", 
+                path.display(), e)
+        })?;
+        
+        serde_json::from_reader(file).map_err(|e| {
+            format!("Failed to parse parameter schedule from '{}': {}", 
+                path.display(), e).into()
+        })
     }
 }
 
 // =================================================================
 // ================== Performance Metrics ==========================
 // =================================================================
+
+fn track_frame_times(
+    mut metrics: ResMut<PerformanceMetrics>,
+) {
+    metrics.end_frame();  // End previous frame
+    metrics.begin_frame(); // Start new frame
+}
 
 impl PerformanceMetrics {
 
@@ -500,6 +563,14 @@ impl Default for DebugConfig {
     }
 }
 
+impl Default for LoggingState {
+    fn default() -> Self {
+        Self {
+            is_logging: false,
+        }
+    }
+}
+
 impl Default for SimulationParams {
     fn default() -> Self {
         Self {
@@ -589,6 +660,16 @@ impl SimulationConfig {
                 .default_value("42"))
             .get_matches();
 
+            let parameter_schedule_path = matches.get_one::<String>("params")
+            .map(|p| {
+                let path = PathBuf::from(p);
+                if !path.exists() {
+                    warn!("Parameter schedule file not found: {}", path.display());
+                }
+                path
+            });
+
+
         let mode = match matches.get_one::<String>("mode").map(|s| s.as_str()) {
             Some("benchmark") => SimulationMode::Benchmark,
             Some("validate") => SimulationMode::Validate,
@@ -604,7 +685,7 @@ impl SimulationConfig {
             benchmark_duration: matches.get_one::<String>("duration")
                 .and_then(|s| s.parse::<f64>().ok())
                 .map(Duration::from_secs_f64),
-            parameter_schedule_path: matches.get_one::<String>("params").map(PathBuf::from),
+            parameter_schedule_path,
             rng_seed: matches.get_one::<String>("seed")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(42),
@@ -680,16 +761,22 @@ fn spawn_boids(
 fn apply_parameter_schedule(
     validator: Res<DeterminismValidator>,
     mut sim_params: ResMut<SimulationParams>,
+    mut logging_state: ResMut<LoggingState>,
 ) {
-    // Only apply parameter changes in benchmark or validation modes
     if validator.validation_mode == ValidationMode::Disabled {
         return;
     }
 
+    // Skip if we're already logging
+    if logging_state.is_logging {
+        return;
+    }
+
     let current_step = validator.current_step;
+    let mut change_applied = false;
     
     for change in &validator.parameter_schedule {
-        if change.step == current_step {
+        if change.step == current_step && !change_applied {
             // Store old value for logging
             let old_value = match change.parameter {
                 ParameterType::Coherence => sim_params.coherence,
@@ -698,23 +785,40 @@ fn apply_parameter_schedule(
                 ParameterType::VisualRange => sim_params.visual_range,
             };
             
-            // Apply change
-            match change.parameter {
-                ParameterType::Coherence => sim_params.coherence = change.value,
-                ParameterType::Separation => sim_params.separation = change.value,
-                ParameterType::Alignment => sim_params.alignment = change.value,
-                ParameterType::VisualRange => sim_params.visual_range = change.value,
+            // Only apply and log if there's an actual change
+            if (match change.parameter {
+                ParameterType::Coherence => sim_params.coherence,
+                ParameterType::Separation => sim_params.separation,
+                ParameterType::Alignment => sim_params.alignment,
+                ParameterType::VisualRange => sim_params.visual_range,
+            } - change.value).abs() > f32::EPSILON {
+                // Apply change
+                match change.parameter {
+                    ParameterType::Coherence => sim_params.coherence = change.value,
+                    ParameterType::Separation => sim_params.separation = change.value,
+                    ParameterType::Alignment => sim_params.alignment = change.value,
+                    ParameterType::VisualRange => sim_params.visual_range = change.value,
+                }
+                
+                logging_state.is_logging = true;
+
+                // Make parameter changes very visible in console
+                info!("╔════════════════════════════════════════════════════════════");
+                info!("║ PARAMETER CHANGE at step {}", current_step);
+                info!("║ {:?}: {:.3} -> {:.3}", change.parameter, old_value, change.value);
+                info!("║ Current parameters:");
+                info!("║   Coherence:    {:.3}", sim_params.coherence);
+                info!("║   Separation:   {:.3}", sim_params.separation);
+                info!("║   Alignment:    {:.3}", sim_params.alignment);
+                info!("║   VisualRange:  {:.3}", sim_params.visual_range);
+                info!("╚════════════════════════════════════════════════════════════");
+                
+                logging_state.is_logging = false;
+                change_applied = true;
             }
-            
-            info!("Step {}: Parameter {:?} changed from {} to {}", 
-                  current_step, change.parameter, old_value, change.value);
-            
-            info!("Current parameters: Coherence={}, Separation={}, Alignment={}, VisualRange={}", 
-                  sim_params.coherence, sim_params.separation, sim_params.alignment, sim_params.visual_range);
         }
     }
 }
-
 // ==============================================================
 // ==================== CORE PHYSICS SYSTEMS ====================
 // ==============================================================
@@ -760,6 +864,7 @@ fn fixed_timestep_physics(
     boid_states.sort_by_key(|(_, _, boid, _)| boid.id);
     
     // 3. Calculate updates using spatial grid for efficient neighbor lookup
+    metrics.begin_movement();
     let updates: Vec<(Entity, Vec2, Vec2)> = boid_states
         .iter()
         .map(|(entity, state, boid, grid_pos)| {
@@ -773,7 +878,6 @@ fn fixed_timestep_physics(
                 for dx in -cell_range..=cell_range {
                     let check_cell = grid_pos.cell + IVec2::new(dx, dy);
                     
-                    // Use the updated is_in_range method
                     if !SpatialGrid::is_in_range(grid_pos.cell, check_cell, params.visual_range) {
                         continue;
                     }
@@ -798,7 +902,6 @@ fn fixed_timestep_physics(
                 }
             }
             
-            // Sort neighbors for deterministic processing
             neighbors.sort_by(|a, b| {
                 a.position.x.partial_cmp(&b.position.x)
                     .unwrap_or(std::cmp::Ordering::Equal)
@@ -818,6 +921,7 @@ fn fixed_timestep_physics(
             (*entity, new_velocity, wrapped_position)
         })
         .collect();
+    metrics.end_movement();
 
     // 4. Apply updates in deterministic order
     for (entity, new_velocity, new_position) in updates {
@@ -844,7 +948,7 @@ fn fixed_timestep_physics(
 
     metrics.end_physics();
 
-    // 5. Collect final states and handle validation
+    // 5. Validation handling
     let final_states: Vec<BoidState> = query.iter().map(|(_, transform, boid, _)| {
         BoidState {
             position: transform.translation.truncate(),
@@ -1634,9 +1738,10 @@ fn main() {
             ..default()
         }))
         .insert_resource(config.clone())
+        .insert_resource(LoggingState::default())
         .insert_resource(Time::<Fixed>::default())
         .insert_resource(PerformanceMetrics::default())
-        .insert_resource(DeterminismValidator::new(&config))
+        .insert_resource(DeterminismValidator::from_config(&config))
         .insert_resource(SimulationRng::new(config.rng_seed))
         .insert_resource(SimulationParams::default())
         .insert_resource(SpatialGrid::default())
@@ -1649,7 +1754,11 @@ fn main() {
             apply_parameter_schedule,
             fixed_timestep_physics,
             update_spatial_grid,
-        ));
+        ).chain());
+
+    // Add frame timing system to run last
+    app.add_systems(Update, track_frame_times.in_set(TimingSet::FrameTiming))
+        .configure_sets(Update, (TimingSet::FrameTiming,).after(handle_non_interactive_modes));
 
     // Mode-specific setup
     match config.mode {

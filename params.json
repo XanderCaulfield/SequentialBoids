@@ -1,0 +1,17 @@
+[
+    {
+        "step": 100,
+        "parameter": "Coherence",
+        "value": 0.02
+    },
+    {
+        "step": 200,
+        "parameter": "Separation",
+        "value": 0.3
+    },
+    {
+        "step": 300,
+        "parameter": "VisualRange",
+        "value": 70.0
+    }
+]

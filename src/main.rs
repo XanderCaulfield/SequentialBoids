@@ -15,7 +15,7 @@ use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use serde::{Serialize, Deserialize};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     error::Error,
     fs::File,
     path::{Path, PathBuf},
@@ -24,7 +24,7 @@ use std::{
 
 // ==================== Constants ====================
 
-const BOID_COUNT: usize = 2000;
+const BOID_COUNT: usize = 200;
 const BOID_SPEED_LIMIT: f32 = 300.0;
 const TRAIL_LENGTH: usize = 25;
 const GRID_CELL_SIZE: f32 = 60.0;
@@ -39,6 +39,7 @@ const NOISE_INFLUENCE: f32 = 0.2;
 
 #[derive(Component, Clone, Debug, Serialize, Deserialize)]
 pub struct Boid {
+    id: u64,
     #[serde(with = "vec2_serde")]
     velocity: Vec2,
     #[serde(skip)]  // Don't serialize trail for benchmarking
@@ -57,6 +58,26 @@ pub struct GridCellText;
 
 #[derive(Component)]
 pub struct FpsText;
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Hash)]
+struct GridKey(i32, i32);
+
+impl From<IVec2> for GridKey {
+    fn from(vec: IVec2) -> Self {
+        GridKey(vec.x, vec.y)
+    }
+}
+
+impl From<GridKey> for IVec2 {
+    fn from(key: GridKey) -> Self {
+        IVec2::new(key.0, key.1)
+    }
+}
+
+impl GridKey {
+    fn x(&self) -> i32 { self.0 }
+    fn y(&self) -> i32 { self.1 }
+}
 
 // =======================================================
 // ==================== UI COMPONENTS ====================
@@ -85,11 +106,14 @@ pub enum UIElement {
 // ==================== RESOURCES ====================
 // ===================================================
 
+/// Spatial partitioning grid for efficient neighbor lookups
+/// Uses a BTreeMap to maintain deterministic ordering of cells
 #[derive(Resource)]
 pub struct SpatialGrid {
-    cells: HashMap<IVec2, Vec<Entity>>,
+    cells: BTreeMap<GridKey, Vec<(Entity, u64)>>,    // Store (Entity, BoidID) pairs
 }
 
+/// Represents the current state of a boid for validation purposes
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BoidState {
     #[serde(with = "vec2_serde")]
@@ -98,35 +122,37 @@ pub struct BoidState {
     velocity: Vec2,
 }
 
+/// Configuration for debug visualization features
 #[derive(Resource)]
 pub struct DebugConfig {
     show_grid: bool,
 }
 
+/// Deterministic random number generator using ChaCha8
+/// This ensures consistent behavior across runs with the same seed
 #[derive(Resource)]
 pub struct SimulationRng(ChaCha8Rng);
 
+/// Core simulation parameters that control boid behavior
 #[derive(Resource, Clone, Serialize, Deserialize)]
 pub struct SimulationParams {
-    coherence: f32,
-    separation: f32,
-    alignment: f32,
-    visual_range: f32,
-    trace_paths: bool,
+    coherence: f32,      // How strongly boids are attracted to the center of mass
+    separation: f32,     // How strongly boids avoid each other
+    alignment: f32,      // How strongly boids align their velocity with neighbors
+    visual_range: f32,   // How far boids can see
+    trace_paths: bool,   // Whether to show movement trails
 }
 
-// ============================================================
-// ==================== Benchmarking Types ====================
-// ============================================================
-
+/// Defines the different modes the simulation can run in
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SimulationMode {
-    Interactive,
-    Benchmark,
-    Validate,
-    Record,
+    Interactive,    // Normal interactive mode with UI
+    Benchmark,      // Performance testing mode
+    Validate,       // Validation against reference data
+    Record,         // Record reference data
 }
 
+/// Main configuration for the simulation, including runtime parameters
 #[derive(Resource, Clone, Serialize, Deserialize)]
 pub struct SimulationConfig {
     pub mode: SimulationMode,
@@ -141,16 +167,18 @@ pub struct SimulationConfig {
     pub noise_seed: u32,
 }
 
+/// Tracks performance metrics for benchmarking and analysis
 #[derive(Resource)]
 pub struct PerformanceMetrics {
-    frame_times: VecDeque<Duration>,
-    physics_times: VecDeque<Duration>,
-    spatial_grid_times: VecDeque<Duration>,
-    movement_times: VecDeque<Duration>,
+    frame_times: VecDeque<Duration>,      // Track complete frame durations
+    physics_times: VecDeque<Duration>,    // Track physics step durations
+    spatial_grid_times: VecDeque<Duration>, // Track spatial partitioning durations
+    movement_times: VecDeque<Duration>,   // Track boid movement calculation durations
     current_frame: MetricsFrame,
     max_samples: usize,
 }
 
+/// Helper struct for tracking timing within a single frame
 #[derive(Default)]
 struct MetricsFrame {
     frame_start: Option<Instant>,
@@ -159,6 +187,7 @@ struct MetricsFrame {
     movement_start: Option<Instant>,
 }
 
+/// Handles validation of simulation determinism
 #[derive(Resource)]
 pub struct DeterminismValidator {
     parameter_schedule: Vec<ParameterChange>,
@@ -167,6 +196,7 @@ pub struct DeterminismValidator {
     validation_mode: ValidationMode,
 }
 
+/// Represents a scheduled change in simulation parameters
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ParameterChange {
     step: u64,                      // Simulation step when the change should occur
@@ -174,6 +204,7 @@ pub struct ParameterChange {
     value: f32,
 }
 
+/// Enum for different parameter types that can be changed
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum ParameterType {
     Coherence,
@@ -182,6 +213,7 @@ pub enum ParameterType {
     VisualRange,
 }
 
+/// Snapshot of simulation state for validation
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StateSnapshot {
     step: u64,
@@ -189,17 +221,19 @@ pub struct StateSnapshot {
     parameters: SimulationParams,
 }
 
+/// Current validation mode of the simulation
 #[derive(Clone, PartialEq)]
 pub enum ValidationMode {
-    Recording,
-    Validating,
-    Disabled,
+    Recording,    // Recording reference data
+    Validating,   // Validating against reference data
+    Disabled,     // Validation disabled
 }
 
 // ===============================================================
 // ==================== Serialization Helpers ====================
 // ===============================================================
 
+/// Serialization helpers for Vec2 type
 mod vec2_serde {
     use bevy::math::Vec2;
     use serde::{self, Deserialize, Deserializer, Serializer};
@@ -224,6 +258,7 @@ mod vec2_serde {
     }
 }
 
+/// Serialization helpers for Duration type
 mod duration_serde {
     use serde::{self, Deserialize, Deserializer, Serializer};
     use std::time::Duration;
@@ -248,12 +283,199 @@ mod duration_serde {
 }
 
 // =================================================================
+// ================== Determinism Validation =======================
+// =================================================================
+
+impl DeterminismValidator {
+    pub fn new(config: &SimulationConfig) -> Self {
+        let validation_mode = match config.mode {
+            SimulationMode::Validate => ValidationMode::Validating,
+            SimulationMode::Record => ValidationMode::Recording,
+            _ => ValidationMode::Disabled,
+        };
+
+        let parameter_schedule = if let Some(ref path) = config.parameter_schedule_path {
+            Self::load_parameter_schedule(path)
+                .unwrap_or_else(|e| {
+                    warn!("Failed to load parameter schedule: {}", e);
+                    Vec::new()
+                })
+        } else {
+            Vec::new()
+        };
+
+        Self {
+            parameter_schedule,
+            snapshots: Vec::new(),
+            current_step: 0,
+            validation_mode,
+        }
+    }
+
+    pub fn validate_state(&self, step: u64, current_states: &[BoidState], params: &SimulationParams) -> bool {
+        if let Some(snapshot) = self.snapshots.iter().find(|s| s.step == step) {
+            // Validate parameters first
+            if !self.validate_parameters(&snapshot.parameters, params) {
+                error!("Parameter mismatch at step {}", step);
+                return false;
+            }
+
+            // Then validate boid states
+            if snapshot.boid_states.len() != current_states.len() {
+                error!("Boid count mismatch at step {}", step);
+                return false;
+            }
+
+            for (expected, actual) in snapshot.boid_states.iter().zip(current_states.iter()) {
+                if !self.validate_boid_state(expected, actual) {
+                    error!("Boid state mismatch at step {}", step);
+                    return false;
+                }
+            }
+            true
+        } else {
+            true // No reference data for this step
+        }
+    }
+
+    fn validate_parameters(&self, expected: &SimulationParams, actual: &SimulationParams) -> bool {
+        const EPSILON: f32 = 1e-6;
+        
+        (expected.coherence - actual.coherence).abs() < EPSILON &&
+        (expected.separation - actual.separation).abs() < EPSILON &&
+        (expected.alignment - actual.alignment).abs() < EPSILON &&
+        (expected.visual_range - actual.visual_range).abs() < EPSILON
+    }
+
+    fn validate_boid_state(&self, expected: &BoidState, actual: &BoidState) -> bool {
+        const EPSILON: f32 = 1e-5;
+        
+        (expected.position - actual.position).length() < EPSILON &&
+        (expected.velocity - actual.velocity).length() < EPSILON
+    }
+
+    pub fn save_reference(&self, path: &Path) -> Result<(), Box<dyn Error>> {
+        let file = File::create(path)?;
+        serde_json::to_writer_pretty(file, &self.snapshots)?;
+        Ok(())
+    }
+
+    pub fn load_reference(&mut self, path: &Path) -> Result<(), Box<dyn Error>> {
+        let file = File::open(path)?;
+        self.snapshots = serde_json::from_reader(file)?;
+        Ok(())
+    }
+
+    fn load_parameter_schedule(path: &Path) -> Result<Vec<ParameterChange>, Box<dyn Error>> {
+        let file = File::open(path)?;
+        Ok(serde_json::from_reader(file)?)
+    }
+}
+
+// =================================================================
+// ================== Performance Metrics ==========================
+// =================================================================
+
+impl PerformanceMetrics {
+
+    pub fn begin_frame(&mut self) {
+        self.current_frame.frame_start = Some(Instant::now());
+    }
+
+    pub fn end_frame(&mut self) {
+        if let Some(start) = self.current_frame.frame_start {
+            self.frame_times.push_back(start.elapsed());
+            if self.frame_times.len() > self.max_samples {
+                self.frame_times.pop_front();
+            }
+        }
+    }
+
+    pub fn begin_physics(&mut self) {
+        self.current_frame.frame_start = Some(Instant::now());
+        self.current_frame.physics_start = Some(Instant::now());
+    }
+
+    pub fn end_physics(&mut self) {
+        if let Some(start) = self.current_frame.physics_start {
+            self.physics_times.push_back(start.elapsed());
+            if self.physics_times.len() > self.max_samples {
+                self.physics_times.pop_front();
+            }
+        }
+    }
+
+    pub fn begin_movement(&mut self) {
+        self.current_frame.movement_start = Some(Instant::now());
+    }
+
+    pub fn end_movement(&mut self) {
+        if let Some(start) = self.current_frame.movement_start {
+            self.movement_times.push_back(start.elapsed());
+            if self.movement_times.len() > self.max_samples {
+                self.movement_times.pop_front();
+            }
+        }
+    }
+
+    pub fn begin_spatial(&mut self) {
+        self.current_frame.spatial_start = Some(Instant::now());
+    }
+
+    pub fn end_spatial(&mut self) {
+        if let Some(start) = self.current_frame.spatial_start {
+            self.spatial_grid_times.push_back(start.elapsed());
+            if self.spatial_grid_times.len() > self.max_samples {
+                self.spatial_grid_times.pop_front();
+            }
+        }
+    }
+
+    pub fn save_benchmark_results(&self, path: &Path) -> Result<(), Box<dyn Error>> {
+        let mut file = File::create(path)?;
+        
+        let results = serde_json::json!({
+            "frame_times": self.frame_times.iter()
+                .map(|d| d.as_secs_f64() * 1000.0)
+                .collect::<Vec<f64>>(),
+            "physics_times": self.physics_times.iter()
+                .map(|d| d.as_secs_f64() * 1000.0)
+                .collect::<Vec<f64>>(),
+            "spatial_times": self.spatial_grid_times.iter()
+                .map(|d| d.as_secs_f64() * 1000.0)
+                .collect::<Vec<f64>>(),
+            "movement_times": self.movement_times.iter()
+                .map(|d| d.as_secs_f64() * 1000.0)
+                .collect::<Vec<f64>>(),
+            "statistics": {
+                "frame_time_avg": self.frame_times.iter()
+                    .map(|d| d.as_secs_f64() * 1000.0)
+                    .sum::<f64>() / self.frame_times.len() as f64,
+                "physics_time_avg": self.physics_times.iter()
+                    .map(|d| d.as_secs_f64() * 1000.0)
+                    .sum::<f64>() / self.physics_times.len() as f64,
+                "spatial_time_avg": self.spatial_grid_times.iter()
+                    .map(|d| d.as_secs_f64() * 1000.0)
+                    .sum::<f64>() / self.spatial_grid_times.len() as f64,
+                "movement_time_avg": self.movement_times.iter()
+                    .map(|d| d.as_secs_f64() * 1000.0)
+                    .sum::<f64>() / self.movement_times.len() as f64,
+            }
+        });
+
+        serde_json::to_writer_pretty(&mut file, &results)?;
+        Ok(())
+    }
+}
+
+// =================================================================
 // ==================== Default Implementations ====================
 // =================================================================
 
 impl Default for Boid {
     fn default() -> Self {
         Self {
+            id: 0,
             velocity: Vec2::ZERO,
             trail: Vec::with_capacity(TRAIL_LENGTH),
             noise_seed: 0,
@@ -265,7 +487,7 @@ impl Default for Boid {
 impl Default for SpatialGrid {
     fn default() -> Self {
         Self {
-            cells: HashMap::new(),
+            cells: BTreeMap::new(),
         }
     }
 }
@@ -278,20 +500,14 @@ impl Default for DebugConfig {
     }
 }
 
-impl Default for SimulationRng {
-    fn default() -> Self {
-        SimulationRng(ChaCha8Rng::seed_from_u64(42))
-    }
-}
-
 impl Default for SimulationParams {
     fn default() -> Self {
         Self {
-            coherence: 0.015,
-            separation: 0.25,
-            alignment: 0.125,
-            visual_range: 60.0,
-            trace_paths: false,
+            coherence: 0.015,    // Default attraction strength
+            separation: 0.25,     // Default separation strength
+            alignment: 0.125,     // Default alignment strength
+            visual_range: 60.0,   // Default vision range
+            trace_paths: false,   // Trails disabled by default
         }
     }
 }
@@ -305,8 +521,8 @@ impl Default for SimulationConfig {
             fixed_time: Some(Time::<Fixed>::default()),
             benchmark_duration: None,
             parameter_schedule_path: None,
-            rng_seed: 42,                       // Default Seed
-            noise_seed: 1,                      // Default Seed
+            rng_seed: 42,        // Default RNG seed
+            noise_seed: 1,       // Default noise seed
         }
     }
 }
@@ -324,13 +540,33 @@ impl Default for PerformanceMetrics {
     }
 }
 
-// ==================================================================
-// ==================== Resource Implementations ====================
-// ==================================================================
+impl SpatialGrid {
+    fn world_to_cell(position: Vec2) -> IVec2 {
+        IVec2::new(
+            (position.x / GRID_CELL_SIZE).floor() as i32,
+            (position.y / GRID_CELL_SIZE).floor() as i32,
+        )
+    }
+
+    // Method to calculate if cells are in range based on visual range
+    fn is_in_range(cell1: IVec2, cell2: IVec2, visual_range: f32) -> bool {
+        let diff = cell2 - cell1;
+        // Calculate how many cells correspond to the visual range
+        // Add 1 to account for partial cells and use ceiling to ensure we don't miss any potential neighbors
+        let max_cell_distance = (visual_range / GRID_CELL_SIZE).ceil() as i32;
+        diff.x.abs() <= max_cell_distance && diff.y.abs() <= max_cell_distance
+    }
+}
+
+impl SimulationRng {
+    pub fn new(seed: u64) -> Self {
+        Self(ChaCha8Rng::seed_from_u64(seed))
+    }
+}
 
 impl SimulationConfig {
     pub fn from_args() -> Self {
-        let matches = Command::new("boids")
+        let matches = Command::new("Boids Simulation")
             .arg(clap::Arg::new("mode")
                 .long("mode")
                 .value_parser(["interactive", "benchmark", "validate", "record"])
@@ -344,26 +580,19 @@ impl SimulationConfig {
             .arg(clap::Arg::new("duration")
                 .long("duration")
                 .value_name("SECONDS"))
-            .arg(clap::Arg::new("parameter-schedule")
-                .long("parameter-schedule")
+            .arg(clap::Arg::new("params")
+                .long("params")
                 .value_name("FILE"))
-            .arg(clap::Arg::new("rng-seed")
-                .long("rng-seed")
-                .value_name("SEED")
-                .value_parser(clap::value_parser!(u64))
+            .arg(clap::Arg::new("seed")
+                .long("seed")
+                .value_name("NUMBER")
                 .default_value("42"))
-            .arg(clap::Arg::new("noise-seed")
-                .long("noise-seed")
-                .value_name("SEED")
-                .value_parser(clap::value_parser!(u32))
-                .default_value("1"))
             .get_matches();
 
-        let mode = match matches.get_one::<String>("mode").unwrap().as_str() {
-            "interactive" => SimulationMode::Interactive,
-            "benchmark" => SimulationMode::Benchmark,
-            "validate" => SimulationMode::Validate,
-            "record" => SimulationMode::Record,
+        let mode = match matches.get_one::<String>("mode").map(|s| s.as_str()) {
+            Some("benchmark") => SimulationMode::Benchmark,
+            Some("validate") => SimulationMode::Validate,
+            Some("record") => SimulationMode::Record,
             _ => SimulationMode::Interactive,
         };
 
@@ -373,198 +602,14 @@ impl SimulationConfig {
             reference_path: matches.get_one::<String>("reference").map(PathBuf::from),
             fixed_time: Some(Time::<Fixed>::default()),
             benchmark_duration: matches.get_one::<String>("duration")
-                .and_then(|d| d.parse::<u64>().ok())
-                .map(|secs| Duration::from_secs(secs)),
-            parameter_schedule_path: matches.get_one::<String>("parameter-schedule").map(PathBuf::from),
-            rng_seed: *matches.get_one::<u64>("rng-seed").unwrap(),
-            noise_seed: *matches.get_one::<u32>("noise-seed").unwrap(),
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(Duration::from_secs_f64),
+            parameter_schedule_path: matches.get_one::<String>("params").map(PathBuf::from),
+            rng_seed: matches.get_one::<String>("seed")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(42),
+            noise_seed: 1,
         }
-    }
-}
-
-impl SimulationRng {
-    pub fn new(seed: u64) -> Self {
-        SimulationRng(ChaCha8Rng::seed_from_u64(seed))
-    }
-}
-
-impl SpatialGrid {
-    fn get_nearby_entities(&self, cell: IVec2) -> Vec<Entity> {
-        let mut nearby = Vec::new();
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                let neighbor_cell = cell + IVec2::new(dx, dy);
-                if let Some(entities) = self.cells.get(&neighbor_cell) {
-                    nearby.extend(entities);
-                }
-            }
-        }
-        nearby
-    }
-    
-    fn world_to_cell(position: Vec2) -> IVec2 {
-        IVec2::new(
-            ((position.x + GRID_CELL_SIZE / 2.0) / GRID_CELL_SIZE).floor() as i32,
-            ((position.y + GRID_CELL_SIZE / 2.0) / GRID_CELL_SIZE).floor() as i32,
-        )
-    }
-}
-
-impl DeterminismValidator {
-    pub fn new(config: &SimulationConfig) -> Self {
-        let validation_mode = match config.mode {
-            SimulationMode::Record => ValidationMode::Recording,
-            SimulationMode::Validate => ValidationMode::Validating,
-            _ => ValidationMode::Disabled,
-        };
-
-        let parameter_schedule = if let Some(path) = &config.parameter_schedule_path {
-            Self::load_parameter_schedule(path).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        Self {
-            parameter_schedule,
-            snapshots: Vec::new(),
-            current_step: 0,
-            validation_mode,
-        }
-    }
-
-    pub fn save_reference(&self, path: &Path) -> Result<(), Box<dyn Error>> {
-        let file = File::create(path)?;
-        serde_json::to_writer_pretty(file, &self.snapshots)?;
-        Ok(())
-    }
-
-    pub fn load_reference(&mut self, path: &Path) -> Result<(), Box<dyn Error>> {
-        let file = File::open(path)?;
-        self.snapshots = serde_json::from_reader(file)?;
-        Ok(())
-    }
-
-    fn load_parameter_schedule(path: &Path) -> Result<Vec<ParameterChange>, Box<dyn Error>> {
-        let file = File::open(path)?;
-        let schedule: Vec<ParameterChange> = serde_json::from_reader(file)?;
-        Ok(schedule)
-    }
-
-    pub fn validate_state(&self, step: u64, current_states: &[BoidState], params: &SimulationParams) -> bool {
-        if let Some(snapshot) = self.snapshots.iter().find(|s| s.step == step) {
-            // Validates number of boids matches
-            if snapshot.boid_states.len() != current_states.len() {
-                return false;
-            }
-    
-            // Validates parameters match
-            if !self.params_match(&snapshot.parameters, params) {
-                return false;
-            }
-    
-            // Validates each boid's state
-            for (recorded, current) in snapshot.boid_states.iter().zip(current_states.iter()) {
-                if !self.states_match(recorded, current) {
-                    return false;
-                }
-            }
-            true
-        } else {
-            true // No snapshot to compare against
-        }
-    }
-
-    fn params_match(&self, recorded: &SimulationParams, current: &SimulationParams) -> bool {
-        const EPSILON: f32 = 1e-6;
-        (recorded.coherence - current.coherence).abs() < EPSILON &&
-        (recorded.separation - current.separation).abs() < EPSILON &&
-        (recorded.alignment - current.alignment).abs() < EPSILON &&
-        (recorded.visual_range - current.visual_range).abs() < EPSILON
-    }
-
-    fn states_match(&self, recorded: &BoidState, current: &BoidState) -> bool {
-        const EPSILON: f32 = 1e-6;
-        (recorded.position - current.position).length_squared() < EPSILON &&
-        (recorded.velocity - current.velocity).length_squared() < EPSILON
-    }
-}
-
-impl PerformanceMetrics {
-    pub fn begin_frame(&mut self) {
-        self.current_frame.frame_start = Some(Instant::now());
-    }
-
-    pub fn end_frame(&mut self) {
-        if let Some(start) = self.current_frame.frame_start.take() {
-            let duration = start.elapsed();
-            if self.frame_times.len() >= self.max_samples {
-                self.frame_times.pop_front();
-            }
-            self.frame_times.push_back(duration);
-        }
-    }
-
-    pub fn begin_physics(&mut self) {
-        self.current_frame.physics_start = Some(Instant::now());
-    }
-
-    pub fn end_physics(&mut self) {
-        if let Some(start) = self.current_frame.physics_start.take() {
-            let duration = start.elapsed();
-            if self.physics_times.len() >= self.max_samples {
-                self.physics_times.pop_front();
-            }
-            self.physics_times.push_back(duration);
-        }
-    }
-
-    pub fn begin_spatial(&mut self) {
-        self.current_frame.spatial_start = Some(Instant::now());
-    }
-
-    pub fn end_spatial(&mut self) {
-        if let Some(start) = self.current_frame.spatial_start.take() {
-            let duration = start.elapsed();
-            if self.spatial_grid_times.len() >= self.max_samples {
-                self.spatial_grid_times.pop_front();
-            }
-            self.spatial_grid_times.push_back(duration);
-        }
-    }
-
-    pub fn begin_movement(&mut self) {
-        self.current_frame.movement_start = Some(Instant::now());
-    }
-
-    pub fn end_movement(&mut self) {
-        if let Some(start) = self.current_frame.movement_start.take() {
-            let duration = start.elapsed();
-            if self.movement_times.len() >= self.max_samples {
-                self.movement_times.pop_front();
-            }
-            self.movement_times.push_back(duration);
-        }
-    }
-
-    pub fn save_benchmark_results(&self, path: &Path) -> Result<(), Box<dyn Error>> {
-        #[derive(Serialize)]
-        struct BenchmarkResults {
-            frame_times: Vec<f64>,
-            physics_times: Vec<f64>,
-            spatial_times: Vec<f64>,
-            movement_times: Vec<f64>,
-        }
-
-        let results = BenchmarkResults {
-            frame_times: self.frame_times.iter().map(|d| d.as_secs_f64()).collect(),
-            physics_times: self.physics_times.iter().map(|d| d.as_secs_f64()).collect(),
-            spatial_times: self.spatial_grid_times.iter().map(|d| d.as_secs_f64()).collect(),
-            movement_times: self.movement_times.iter().map(|d| d.as_secs_f64()).collect(),
-        };
-
-        let file = File::create(path)?;
-        serde_json::to_writer_pretty(file, &results)?;
-        Ok(())
     }
 }
 
@@ -572,6 +617,7 @@ impl PerformanceMetrics {
 // ==================== SETUP SYSTEMS ====================
 // =======================================================
 
+/// Initial setup of the simulation environment
 fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -583,6 +629,7 @@ fn setup(
     spawn_boids(&mut commands, &mut meshes, &mut materials, &mut rng);
 }
 
+/// Spawns initial boid entities with deterministic positions and velocities
 fn spawn_boids(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
@@ -593,6 +640,7 @@ fn spawn_boids(
     let material = materials.add(ColorMaterial::from(Color::srgb(0.33, 0.55, 0.95)));
 
     for i in 0..BOID_COUNT {
+        // Generate deterministic initial conditions using the seeded RNG
         let velocity = Vec2::new(
             rng.0.gen_range(-150.0..150.0),
             rng.0.gen_range(-150.0..150.0)
@@ -608,6 +656,7 @@ fn spawn_boids(
 
         commands.spawn((
             Boid {
+                id: i as u64,
                 velocity,
                 trail,
                 noise_seed: i as u64,
@@ -627,6 +676,7 @@ fn spawn_boids(
     }
 }
 
+/// Applies scheduled parameter changes at appropriate simulation steps
 fn apply_parameter_schedule(
     validator: Res<DeterminismValidator>,
     mut sim_params: ResMut<SimulationParams>,
@@ -656,11 +706,9 @@ fn apply_parameter_schedule(
                 ParameterType::VisualRange => sim_params.visual_range = change.value,
             }
             
-            // Log the change with before/after values
             info!("Step {}: Parameter {:?} changed from {} to {}", 
                   current_step, change.parameter, old_value, change.value);
             
-            // Log current state of all parameters
             info!("Current parameters: Coherence={}, Separation={}, Alignment={}, VisualRange={}", 
                   sim_params.coherence, sim_params.separation, sim_params.alignment, sim_params.visual_range);
         }
@@ -671,6 +719,9 @@ fn apply_parameter_schedule(
 // ==================== CORE PHYSICS SYSTEMS ====================
 // ==============================================================
 
+/// Main physics system that runs at a fixed timestep
+/// This is crucial for deterministic behavior as it ensures consistent simulation steps
+/// regardless of frame rate
 fn fixed_timestep_physics(
     fixed_time: Res<Time<Fixed>>,
     mut metrics: ResMut<PerformanceMetrics>,
@@ -678,8 +729,8 @@ fn fixed_timestep_physics(
     mut query: Query<(Entity, &mut Transform, &mut Boid, &GridPosition)>,
     grid: Res<SpatialGrid>,
     params: Res<SimulationParams>,
-    window_query: Query<&Window>,
     config: Res<SimulationConfig>,
+    window_query: Query<&Window>,
 ) {
     metrics.begin_physics();
     
@@ -687,21 +738,114 @@ fn fixed_timestep_physics(
     let validation_mode = validator.validation_mode.clone();
     let current_step = validator.current_step;
     
-    update_physics_step(
-        dt,
-        &mut validator,
-        &mut query,
-        &grid,
-        &params,
-        &window_query,
-        &mut metrics,
-        &config,
-    );
+    let window = window_query.single();
+    let width = window.width();
+    let height = window.height();
+    
+    // 1. Collect all current states in a deterministic order
+    let mut boid_states: Vec<(Entity, BoidState, &Boid, &GridPosition)> = query
+        .iter()
+        .map(|(entity, transform, boid, grid_pos)| {
+            (entity, 
+             BoidState {
+                position: transform.translation.truncate(),
+                velocity: boid.velocity,
+             },
+             boid,
+             grid_pos)
+        })
+        .collect();
+    
+    // 2. Sort by entity ID for deterministic ordering
+    boid_states.sort_by_key(|(_, _, boid, _)| boid.id);
+    
+    // 3. Calculate updates using spatial grid for efficient neighbor lookup
+    let updates: Vec<(Entity, Vec2, Vec2)> = boid_states
+        .iter()
+        .map(|(entity, state, boid, grid_pos)| {
+            let mut neighbors: Vec<&BoidState> = Vec::new();
+            
+            // Calculate cell range based on visual range
+            let cell_range = (params.visual_range / GRID_CELL_SIZE).ceil() as i32;
+            
+            // Check cells within the calculated range
+            for dy in -cell_range..=cell_range {
+                for dx in -cell_range..=cell_range {
+                    let check_cell = grid_pos.cell + IVec2::new(dx, dy);
+                    
+                    // Use the updated is_in_range method
+                    if !SpatialGrid::is_in_range(grid_pos.cell, check_cell, params.visual_range) {
+                        continue;
+                    }
+                    
+                    if let Some(cell_entities) = grid.cells.get(&GridKey::from(check_cell)) {
+                        // Add states for boids in this cell
+                        for &(other_entity, _) in cell_entities {
+                            if other_entity != *entity {
+                                if let Some(other_state) = boid_states.iter()
+                                    .find(|(e, _, _, _)| *e == other_entity)
+                                    .map(|(_, state, _, _)| state) {
+                                    
+                                    // Final precise distance check
+                                    let diff = other_state.position - state.position;
+                                    if diff.length() <= params.visual_range {
+                                        neighbors.push(other_state);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Sort neighbors for deterministic processing
+            neighbors.sort_by(|a, b| {
+                a.position.x.partial_cmp(&b.position.x)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.position.y.partial_cmp(&b.position.y)
+                        .unwrap_or(std::cmp::Ordering::Equal))
+            });
+            
+            let (new_velocity, new_position) = 
+                calculate_boid_update(state, boid, &neighbors, &params, dt, &config);
+
+            // Apply screen wrapping
+            let wrapped_position = Vec2::new(
+                (new_position.x + width / 2.0).rem_euclid(width) - width / 2.0,
+                (new_position.y + height / 2.0).rem_euclid(height) - height / 2.0
+            );
+            
+            (*entity, new_velocity, wrapped_position)
+        })
+        .collect();
+
+    // 4. Apply updates in deterministic order
+    for (entity, new_velocity, new_position) in updates {
+        if let Ok((_, mut transform, mut boid, _)) = query.get_mut(entity) {
+            boid.velocity = new_velocity;
+            transform.translation = new_position.extend(transform.translation.z);
+            boid.frame_count += 1;
+            
+            // Update trail
+            if params.trace_paths {
+                boid.trail.push(new_position);
+                if boid.trail.len() > TRAIL_LENGTH {
+                    boid.trail.remove(0);
+                }
+            }
+            
+            // Update rotation deterministically
+            if boid.velocity.length_squared() > 0.0 {
+                let angle = boid.velocity.y.atan2(boid.velocity.x);
+                transform.rotation = Quat::from_rotation_z(angle - std::f32::consts::FRAC_PI_2);
+            }
+        }
+    }
 
     metrics.end_physics();
 
-    // Handle validation and recording after physics update
-    let current_states: Vec<BoidState> = query.iter().map(|(_, transform, boid, _)| {
+    // 5. Collect final states and handle validation
+    let final_states: Vec<BoidState> = query.iter().map(|(_, transform, boid, _)| {
         BoidState {
             position: transform.translation.truncate(),
             velocity: boid.velocity,
@@ -710,17 +854,16 @@ fn fixed_timestep_physics(
 
     match validation_mode {
         ValidationMode::Validating => {
-            if !validator.validate_state(current_step, &current_states, &params) {
+            if !validator.validate_state(current_step, &final_states, &params) {
                 error!("State validation failed at step {}", current_step);
             }
             validator.current_step += 1;
         },
         ValidationMode::Recording => {
-            // Only record every 1000th frame to keep file size manageable
-            if current_step % 1000 == 0 {
+            if current_step % 1000 == 0 {  // Record every 1000th step
                 validator.snapshots.push(StateSnapshot {
                     step: current_step,
-                    boid_states: current_states,
+                    boid_states: final_states,
                     parameters: params.clone(),
                 });
             }
@@ -730,153 +873,84 @@ fn fixed_timestep_physics(
     }
 }
 
-fn update_physics_step(
-    dt: f32,
-    validator: &mut DeterminismValidator,
-    query: &mut Query<(Entity, &mut Transform, &mut Boid, &GridPosition)>,
-    grid: &SpatialGrid,
+/// Calculates the new velocity and position for a single boid
+/// All inputs are processed in a deterministic order
+fn calculate_boid_update(
+    state: &BoidState,
+    boid: &Boid,
+    neighbors: &[&BoidState],
     params: &SimulationParams,
-    window_query: &Query<&Window>,
-    metrics: &mut PerformanceMetrics,
+    dt: f32,
     config: &SimulationConfig,
-) {
-    let window = window_query.single();
-    let width = window.width();
-    let height = window.height();
-    
+) -> (Vec2, Vec2) {
+    let mut center_of_mass = Vec2::ZERO;
+    let mut avoid_vector = Vec2::ZERO;
+    let mut average_velocity = Vec2::ZERO;
+    let mut num_neighbors = 0;
+
+    // Process neighbors in their sorted order
+    for neighbor in neighbors {
+        let diff = neighbor.position - state.position;
+        let distance = diff.length();
+        
+        if distance < params.visual_range && distance > 0.0 {
+            // Accumulate in deterministic order
+            center_of_mass += neighbor.position;
+            
+            if distance < params.visual_range / 2.0 {
+                avoid_vector -= diff.normalize() * (params.visual_range / (2.0 * distance.max(0.1)));
+            }
+            
+            average_velocity += neighbor.velocity;
+            num_neighbors += 1;
+        }
+    }
+
+    let mut new_velocity = state.velocity;
+
+    if num_neighbors > 0 {
+        // Calculate forces in deterministic order
+        center_of_mass /= num_neighbors as f32;
+        average_velocity /= num_neighbors as f32;
+        
+        // Apply forces in fixed order for determinism
+        let coherence = (center_of_mass - state.position) * params.coherence;
+        let separation = avoid_vector * params.separation;
+        let alignment = (average_velocity - state.velocity) * params.alignment;
+        
+        new_velocity += coherence;
+        new_velocity += separation;
+        new_velocity += alignment;
+    }
+
+    // Apply noise influence deterministically using boid ID
     let perlin = Perlin::new(config.noise_seed);
+    let noise_value = get_deterministic_noise(&perlin, boid, boid.frame_count);
+    let turn_angle = noise_value * NOISE_STRENGTH * dt * NOISE_INFLUENCE;
+    let (sin, cos) = turn_angle.sin_cos();
+    let noise_direction = Vec2::new(
+        new_velocity.x * cos - new_velocity.y * sin,
+        new_velocity.x * sin + new_velocity.y * cos
+    ).normalize();
     
-    // Cache current positions and velocities
-    let boids_data: HashMap<Entity, (Vec2, Vec2)> = query
-        .iter()
-        .map(|(entity, transform, boid, _)| {
-            (entity, (transform.translation.truncate(), boid.velocity))
-        })
-        .collect();
-    
-    // Start timing movement calculations
-    metrics.begin_movement();
-    
-    for (entity, mut transform, mut boid, grid_pos) in query.iter_mut() {
-        let current_position = transform.translation.truncate();
-        let nearby_entities = grid.get_nearby_entities(grid_pos.cell);
-        
-        // Calculate flocking forces
-        let mut center_of_mass = Vec2::ZERO;
-        let mut avoid_vector = Vec2::ZERO;
-        let mut average_velocity = Vec2::ZERO;
-        let mut num_neighbors = 0;
-        
-        for &other_entity in &nearby_entities {
-            if other_entity == entity {
-                continue;
-            }
-            
-            if let Some((other_pos, other_vel)) = boids_data.get(&other_entity) {
-                let diff = *other_pos - current_position;
-                let distance = diff.length();
-                
-                if distance < params.visual_range && distance > 0.0 {
-                    center_of_mass += *other_pos;
-                    
-                    if distance < params.visual_range / 2.0 {
-                        avoid_vector -= diff.normalize() * (params.visual_range / (2.0 * distance.max(0.1)));
-                    }
-                    
-                    average_velocity += *other_vel;
-                    num_neighbors += 1;
-                }
-            }
-        }
+    new_velocity = new_velocity.lerp(noise_direction * new_velocity.length(), NOISE_INFLUENCE);
 
-        // Apply flocking rules if we have neighbors
-        if num_neighbors > 0 {
-            center_of_mass /= num_neighbors as f32;
-            average_velocity /= num_neighbors as f32;
-            
-            let coherence = (center_of_mass - current_position) * params.coherence;
-            let separation = avoid_vector * params.separation;
-            let alignment = (average_velocity - boid.velocity) * params.alignment;
-            
-            boid.velocity += coherence + separation + alignment;
-        }
-
-        // Apply noise influence
-        boid.frame_count += 1;
-        let noise_value = get_deterministic_noise(&perlin, &boid, boid.frame_count);
-        let turn_angle = noise_value * NOISE_STRENGTH * dt * NOISE_INFLUENCE;
-        let (sin, cos) = turn_angle.sin_cos();
-        let noise_direction = Vec2::new(
-            boid.velocity.x * cos - boid.velocity.y * sin,
-            boid.velocity.x * sin + boid.velocity.y * cos
-        ).normalize();
-        
-        boid.velocity = boid.velocity.lerp(noise_direction * boid.velocity.length(), NOISE_INFLUENCE);
-        
-        // Apply speed limits
-        let speed = boid.velocity.length();
-        if speed < BOID_SPEED_LIMIT / 2.0 {
-            boid.velocity = boid.velocity.normalize() * (BOID_SPEED_LIMIT / 2.0);
-        } else if speed > BOID_SPEED_LIMIT {
-            boid.velocity = boid.velocity.normalize() * BOID_SPEED_LIMIT;
-        }
-        
-        // Update position with dt
-        let new_position = current_position + boid.velocity * dt;
-        
-        // Handle screen wrapping
-        let wrapped_position = Vec2::new(
-            (new_position.x + width / 2.0).rem_euclid(width) - width / 2.0,
-            (new_position.y + height / 2.0).rem_euclid(height) - height / 2.0
-        );
-        
-        // Update transform
-        transform.translation = wrapped_position.extend(transform.translation.z);
-        
-        // Update rotation
-        if boid.velocity.length_squared() > 0.0 {
-            let angle = boid.velocity.y.atan2(boid.velocity.x);
-            transform.rotation = Quat::from_rotation_z(angle - std::f32::consts::FRAC_PI_2);
-        }
-
-        // Update trail if enabled
-        if params.trace_paths {
-            if boid.trail.is_empty() {
-                boid.trail.push(wrapped_position);
-            } else {
-                let last_pos = *boid.trail.last().unwrap();
-                let distance = (wrapped_position - last_pos).length();
-                
-                if distance > 5.0 {
-                    boid.trail.push(wrapped_position);
-                    if boid.trail.len() > TRAIL_LENGTH {
-                        boid.trail.remove(0);
-                    }
-                }
-            }
-        }
+    // Apply speed limits deterministically
+    let speed = new_velocity.length();
+    if speed < BOID_SPEED_LIMIT / 2.0 {
+        new_velocity = new_velocity.normalize() * (BOID_SPEED_LIMIT / 2.0);
+    } else if speed > BOID_SPEED_LIMIT {
+        new_velocity = new_velocity.normalize() * BOID_SPEED_LIMIT;
     }
 
-    metrics.end_movement();
+    // Calculate new position (wrapping will be applied in the physics system)
+    let new_position = state.position + new_velocity * dt;
 
-    // State validation for benchmarking modes
-    if validator.validation_mode == ValidationMode::Validating {
-        let current_states: Vec<BoidState> = query.iter().map(|(_, transform, boid, _)| {
-            BoidState {
-                position: transform.translation.truncate(),
-                velocity: boid.velocity,
-            }
-        }).collect();
-
-        if !validator.validate_state(validator.current_step, &current_states, params) {
-            error!("State validation failed at step {}", validator.current_step);
-        }
-        
-        // Increment the step counter
-        validator.current_step += 1;
-    }
+    (new_velocity, new_position)
 }
 
+/// Generates deterministic noise value for a boid's movement
+/// Uses the boid's ID and frame count to ensure reproducibility
 fn get_deterministic_noise(perlin: &Perlin, boid: &Boid, frame: u64) -> f32 {
     let noise1 = perlin.get([
         (frame as f64) * NOISE_SCALE,
@@ -895,9 +969,11 @@ fn get_deterministic_noise(perlin: &Perlin, boid: &Boid, frame: u64) -> f32 {
     (noise1 + noise2) * 0.5
 }
 
+/// Updates the spatial grid for efficient neighbor lookups
+/// Maintains deterministic ordering of entities within cells
 fn update_spatial_grid(
     mut grid: ResMut<SpatialGrid>,
-    query: Query<(Entity, &Transform, &GridPosition), With<Boid>>,
+    query: Query<(Entity, &Transform, &GridPosition, &Boid)>,
     mut commands: Commands,
     mut metrics: ResMut<PerformanceMetrics>,
 ) {
@@ -905,7 +981,7 @@ fn update_spatial_grid(
     
     grid.cells.clear();
     
-    for (entity, transform, grid_pos) in query.iter() {
+    for (entity, transform, grid_pos, boid) in query.iter() {
         let position = transform.translation.truncate();
         let new_cell = SpatialGrid::world_to_cell(position);
         
@@ -913,57 +989,24 @@ fn update_spatial_grid(
             commands.entity(entity).insert(GridPosition { cell: new_cell });
         }
         
-        grid.cells.entry(new_cell).or_default().push(entity);
+        grid.cells.entry(GridKey::from(new_cell))
+            .or_default()
+            .push((entity, boid.id));
+    }
+
+    // Sort entities within each cell by boid ID for deterministic ordering
+    for entities in grid.cells.values_mut() {
+        entities.sort_by_key(|&(_, id)| id);
     }
 
     metrics.end_spatial();
-}
-
-fn handle_non_interactive_modes(
-    config: Res<SimulationConfig>,
-    metrics: Res<PerformanceMetrics>,
-    validator: Res<DeterminismValidator>,
-    time: Res<Time>,
-    mut app_exit: EventWriter<AppExit>,
-) {
-    match config.mode {
-        SimulationMode::Interactive => return,
-        SimulationMode::Benchmark => {
-            if let Some(duration) = config.benchmark_duration {
-                if time.elapsed() >= duration {
-                    if let Some(path) = &config.output_path {
-                        metrics.save_benchmark_results(path)
-                            .expect("Failed to save benchmark results");
-                    }
-                    app_exit.send(AppExit::Success);
-                }
-            }
-        }
-        SimulationMode::Record => {
-            if let Some(duration) = config.benchmark_duration {
-                if time.elapsed() >= duration {
-                    if let Some(path) = &config.output_path {
-                        validator.save_reference(path)
-                            .expect("Failed to save reference data");
-                    }
-                    app_exit.send(AppExit::Success);
-                }
-            }
-        }
-        SimulationMode::Validate => {
-            if let Some(duration) = config.benchmark_duration {
-                if time.elapsed() >= duration {
-                    app_exit.send(AppExit::Success);
-                }
-            }
-        }
-    }
 }
 
 // ====================================================
 // ==================== UI SYSTEMS ====================
 // ====================================================
 
+/// Sets up the user interface elements including parameter controls and debug info
 fn setup_ui(mut commands: Commands) {
     commands
         .spawn(NodeBundle {
@@ -978,7 +1021,7 @@ fn setup_ui(mut commands: Commands) {
             ..default()
         })
         .with_children(|parent| {
-            // FPS Counter
+            // FPS Counter in top-left corner
             parent.spawn(NodeBundle {
                 style: Style {
                     position_type: PositionType::Absolute,
@@ -1002,7 +1045,7 @@ fn setup_ui(mut commands: Commands) {
                 ));
             });
 
-            // Control Panel
+            // Control Panel at bottom
             parent.spawn(NodeBundle {
                 style: Style {
                     width: Val::Percent(100.0),
@@ -1027,6 +1070,7 @@ fn setup_ui(mut commands: Commands) {
         });
 }
 
+/// Helper function to create a text input field with label
 fn spawn_text_input(parent: &mut ChildBuilder, label: &str, default_value: &str, ui_element: UIElement) {
     parent
         .spawn(NodeBundle {
@@ -1087,6 +1131,7 @@ fn spawn_text_input(parent: &mut ChildBuilder, label: &str, default_value: &str,
         });
 }
 
+/// Helper function to create a button with text
 fn spawn_button(parent: &mut ChildBuilder, text: &str, ui_element: UIElement) {
     parent.spawn((
         ButtonBundle {
@@ -1114,6 +1159,7 @@ fn spawn_button(parent: &mut ChildBuilder, text: &str, ui_element: UIElement) {
     });
 }
 
+/// Updates the FPS counter text
 fn update_fps_text(
     diagnostics: Res<DiagnosticsStore>,
     mut query: Query<&mut Text, With<FpsText>>,
@@ -1127,6 +1173,7 @@ fn update_fps_text(
     }
 }
 
+/// Handles text input for parameter adjustment fields
 fn handle_text_input(
     mut text_query: Query<(&mut TextInput, &mut Text, &mut BackgroundColor, &Interaction, &UIElement)>,
     mut sim_params: ResMut<SimulationParams>,
@@ -1170,18 +1217,7 @@ fn handle_text_input(
                     cursor_visible: true,
                 };
 
-                let mut handled = true;
                 match event.key_code {
-                    KeyCode::ArrowLeft => {
-                        if state.cursor_position > 0 {
-                            state.cursor_position -= 1;
-                        }
-                    }
-                    KeyCode::ArrowRight => {
-                        if state.cursor_position < state.buffer.len() {
-                            state.cursor_position += 1;
-                        }
-                    }
                     KeyCode::Backspace => {
                         if state.cursor_position > 0 {
                             state.buffer.remove(state.cursor_position - 1);
@@ -1191,6 +1227,16 @@ fn handle_text_input(
                     KeyCode::Delete => {
                         if state.cursor_position < state.buffer.len() {
                             state.buffer.remove(state.cursor_position);
+                        }
+                    }
+                    KeyCode::ArrowLeft => {
+                        if state.cursor_position > 0 {
+                            state.cursor_position -= 1;
+                        }
+                    }
+                    KeyCode::ArrowRight => {
+                        if state.cursor_position < state.buffer.len() {
+                            state.cursor_position += 1;
                         }
                     }
                     KeyCode::Enter | KeyCode::NumpadEnter => {
@@ -1207,25 +1253,20 @@ fn handle_text_input(
                         input.is_focused = false;
                     }
                     key_code => {
-                        if let Some(char) = key_code_to_char(key_code) {
-                            if char.is_ascii_digit() || char == '.' {
-                                state.buffer.insert(state.cursor_position, char);
-                                state.cursor_position += 1;
-                            }
-                        } else {
-                            handled = false;
+                        if let Some(c) = key_code_to_char(key_code) {
+                            state.buffer.insert(state.cursor_position, c);
+                            state.cursor_position += 1;
                         }
                     }
                 }
 
-                if handled {
-                    update_text_state_safe(&mut input, &mut text, state);
-                }
+                update_text_state_safe(&mut input, &mut text, state);
             }
         }
     }
 }
 
+/// Helper struct for managing text input state
 #[derive(Clone)]
 struct TextState {
     buffer: String,
@@ -1233,6 +1274,7 @@ struct TextState {
     cursor_visible: bool,
 }
 
+/// Safely updates the text input state maintaining cursor visibility
 fn update_text_state_safe(input: &mut TextInput, text: &mut Text, state: TextState) {
     input.buffer = state.buffer.clone();
     input.cursor_position = state.cursor_position;
@@ -1249,6 +1291,7 @@ fn update_text_state_safe(input: &mut TextInput, text: &mut Text, state: TextSta
     text.sections[0].value = display;
 }
 
+/// Updates the cursor blink state for text inputs
 fn update_cursor(
     time: Res<Time>,
     mut query: Query<(&mut TextInput, &mut Text)>,
@@ -1269,28 +1312,18 @@ fn update_cursor(
     }
 }
 
-fn key_code_to_char(key_code: KeyCode) -> Option<char> {
-    match key_code {
-        KeyCode::Digit0 | KeyCode::Numpad0 => Some('0'),
-        KeyCode::Digit1 | KeyCode::Numpad1 => Some('1'),
-        KeyCode::Digit2 | KeyCode::Numpad2 => Some('2'),
-        KeyCode::Digit3 | KeyCode::Numpad3 => Some('3'),
-        KeyCode::Digit4 | KeyCode::Numpad4 => Some('4'),
-        KeyCode::Digit5 | KeyCode::Numpad5 => Some('5'),
-        KeyCode::Digit6 | KeyCode::Numpad6 => Some('6'),
-        KeyCode::Digit7 | KeyCode::Numpad7 => Some('7'),
-        KeyCode::Digit8 | KeyCode::Numpad8 => Some('8'),
-        KeyCode::Digit9 | KeyCode::Numpad9 => Some('9'),
-        KeyCode::Period | KeyCode::NumpadDecimal => Some('.'),
-        _ => None,
-    }
-}
+// =======================================================
+// ==================== CONTROL SYSTEMS ====================
+// =======================================================
 
+/// Handles button interactions including reset and trace path toggles
+/// Ensures deterministic reset behavior by reinitializing RNG with original seed
 fn handle_button_clicks(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut rng: ResMut<SimulationRng>,
+    config: Res<SimulationConfig>,
     interaction_query: Query<(&Interaction, &UIElement, &Children), (Changed<Interaction>, With<UIElement>)>,
     mut sim_params: ResMut<SimulationParams>,
     boid_query: Query<Entity, With<Boid>>,
@@ -1301,17 +1334,19 @@ fn handle_button_clicks(
         if let Interaction::Pressed = *interaction {
             match ui_element {
                 UIElement::ResetButton => {
-                    // Clean up grid text entities
+                    // Clean up existing entities
                     for entity in grid_text_query.iter() {
                         commands.entity(entity).despawn_recursive();
                     }
                     
-                    // Clean up boids
                     for entity in boid_query.iter() {
                         commands.entity(entity).despawn_recursive();
                     }
                     
-                    // Spawn new boids
+                    // Reset RNG to initial seed for deterministic behavior
+                    *rng = SimulationRng::new(config.rng_seed);
+                    
+                    // Spawn new boids with reset RNG
                     spawn_boids(&mut commands, &mut meshes, &mut materials, &mut rng);
                 }
                 UIElement::TracePathsButton => {
@@ -1332,17 +1367,90 @@ fn handle_button_clicks(
     }
 }
 
+/// Handles the escape key for application exit
+fn handle_escape(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut exit: EventWriter<AppExit>,
+) {
+    if keyboard.just_pressed(KeyCode::Escape) {
+        exit.send(AppExit::Success);
+    }
+}
+
 // ===============================================================
-// ==================== VISUALISATION SYSTEMS ====================
+// ==================== VISUALIZATION SYSTEMS ====================
 // ===============================================================
 
+/// Renders movement trails for boids when enabled
+fn update_trails(
+    mut gizmos: Gizmos,
+    query: Query<&Boid>,
+    sim_params: Res<SimulationParams>,
+    window_query: Query<&Window>,
+) {
+    if !sim_params.trace_paths {
+        return;
+    }
+
+    let window = window_query.single();
+    let width = window.width();
+    let height = window.height();
+
+    for boid in query.iter() {
+        if boid.trail.len() < 2 {
+            continue;
+        }
+
+        let alpha_step = 1.0 / (boid.trail.len() as f32);
+        
+        for i in 0..boid.trail.len() - 1 {
+            let p1 = boid.trail[i];
+            let p2 = boid.trail[i + 1];
+            let alpha = alpha_step * (i as f32);
+
+            // Calculate shortest path considering screen wrapping
+            let dx = (p2.x - p1.x).abs();
+            let dy = (p2.y - p1.y).abs();
+            
+            let wrapped_dx = if dx > width / 2.0 {
+                if p2.x > p1.x {
+                    p2.x - width - p1.x
+                } else {
+                    p2.x + width - p1.x
+                }
+            } else {
+                p2.x - p1.x
+            };
+
+            let wrapped_dy = if dy > height / 2.0 {
+                if p2.y > p1.y {
+                    p2.y - height - p1.y
+                } else {
+                    p2.y + height - p1.y
+                }
+            } else {
+                p2.y - p1.y
+            };
+
+            if wrapped_dx.abs() < width / 2.0 && wrapped_dy.abs() < height / 2.0 {
+                gizmos.line_2d(
+                    p1,
+                    p1 + Vec2::new(wrapped_dx, wrapped_dy),
+                    Color::srgba(0.33, 0.55, 0.95, alpha),
+                );
+            }
+        }
+    }
+}
+
+/// Renders the spatial grid for debugging when enabled
 fn draw_spatial_grid(
     mut commands: Commands,
     mut gizmos: Gizmos,
     grid: Res<SpatialGrid>,
     debug_config: Res<DebugConfig>,
-    window_query: Query<&Window>,
     text_query: Query<Entity, With<GridCellText>>,
+    window_query: Query<&Window>,
 ) {
     // Clean up existing grid text entities
     for entity in text_query.iter() {
@@ -1384,10 +1492,10 @@ fn draw_spatial_grid(
     }
 
     // Draw occupied cells and their counts
-    for (&cell, entities) in grid.cells.iter() {
+    for (cell, entities) in grid.cells.iter() {
         let cell_pos = Vec2::new(
-            (cell.x as f32 * GRID_CELL_SIZE) + (GRID_CELL_SIZE / 2.0),
-            (cell.y as f32 * GRID_CELL_SIZE) + (GRID_CELL_SIZE / 2.0),
+            (cell.x() as f32 * GRID_CELL_SIZE) + (GRID_CELL_SIZE / 2.0),
+            (cell.y() as f32 * GRID_CELL_SIZE) + (GRID_CELL_SIZE / 2.0),
         );
 
         if cell_pos.x >= -half_width - GRID_CELL_SIZE && 
@@ -1434,65 +1542,7 @@ fn draw_spatial_grid(
     }
 }
 
-fn update_trails(
-    mut gizmos: Gizmos,
-    query: Query<&Boid>,
-    sim_params: Res<SimulationParams>,
-    window_query: Query<&Window>,
-) {
-    if !sim_params.trace_paths {
-        return;
-    }
-
-    let window = window_query.single();
-    let width = window.width();
-    let height = window.height();
-
-    for boid in query.iter() {
-        if boid.trail.len() < 2 {
-            continue;
-        }
-
-        for i in 0..boid.trail.len() - 1 {
-            let p1 = boid.trail[i];
-            let p2 = boid.trail[i + 1];
-
-            // Calculate the shortest path between points considering screen wrapping
-            let dx = (p2.x - p1.x).abs();
-            let dy = (p2.y - p1.y).abs();
-            
-            let wrapped_dx = if dx > width / 2.0 {
-                if p2.x > p1.x {
-                    p2.x - width - p1.x
-                } else {
-                    p2.x + width - p1.x
-                }
-            } else {
-                p2.x - p1.x
-            };
-
-            let wrapped_dy = if dy > height / 2.0 {
-                if p2.y > p1.y {
-                    p2.y - height - p1.y
-                } else {
-                    p2.y + height - p1.y
-                }
-            } else {
-                p2.y - p1.y
-            };
-
-            // Draw the line if it's a reasonable length
-            if wrapped_dx.abs() < width / 2.0 && wrapped_dy.abs() < height / 2.0 {
-                gizmos.line_2d(
-                    p1,
-                    p1 + Vec2::new(wrapped_dx, wrapped_dy),
-                    Color::srgba(0.33, 0.55, 0.95, 0.1),
-                );
-            }
-        }
-    }
-}
-
+/// Toggles grid visibility for debugging
 fn toggle_grid_visibility(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut debug_config: ResMut<DebugConfig>,
@@ -1502,6 +1552,7 @@ fn toggle_grid_visibility(
     }
 }
 
+/// Cleans up trails when trace paths is toggled off
 fn cleanup_trails_on_toggle(
     mut query: Query<&mut Boid>,
     sim_params: Res<SimulationParams>,
@@ -1520,6 +1571,54 @@ fn cleanup_trails_on_toggle(
 // ================================================================
 // ==================== MAIN APP CONFIGURATION ====================
 // ================================================================
+
+/// Handles non-interactive simulation modes (benchmark, validate, record)
+fn handle_non_interactive_modes(
+    config: Res<SimulationConfig>,
+    metrics: Res<PerformanceMetrics>,
+    validator: Res<DeterminismValidator>,
+    time: Res<Time>,
+    mut app_exit: EventWriter<AppExit>,
+) {
+    match config.mode {
+        SimulationMode::Interactive => return,
+        SimulationMode::Benchmark => {
+            if let Some(duration) = config.benchmark_duration {
+                if time.elapsed() >= duration {
+                    if let Some(path) = &config.output_path {
+                        info!("Saving benchmark results after {}s", time.elapsed().as_secs_f32());
+                        metrics.save_benchmark_results(path)
+                            .expect("Failed to save benchmark results");
+                    }
+                    app_exit.send(AppExit::Success);
+                }
+            }
+        }
+        SimulationMode::Record => {
+            if let Some(duration) = config.benchmark_duration {
+                if time.elapsed() >= duration {
+                    if let Some(path) = &config.output_path {
+                        info!("Saving reference data after {}s", time.elapsed().as_secs_f32());
+                        validator.save_reference(path)
+                            .expect("Failed to save reference data");
+                    }
+                    info!("Recording complete - exiting");
+                    app_exit.send(AppExit::Success);
+                }
+            } else {
+                warn!("No duration set for recording mode");
+            }
+        }
+        SimulationMode::Validate => {
+            if let Some(duration) = config.benchmark_duration {
+                if time.elapsed() >= duration {
+                    info!("Validation complete after {}s", time.elapsed().as_secs_f32());
+                    app_exit.send(AppExit::Success);
+                }
+            }
+        }
+    }
+}
 
 fn main() {
     let config = SimulationConfig::from_args();
@@ -1552,32 +1651,63 @@ fn main() {
             update_spatial_grid,
         ));
 
-    // Only add interactive elements in interactive mode
-    if matches!(config.mode, SimulationMode::Interactive) {
-        app.add_plugins(FrameTimeDiagnosticsPlugin::default())
-            .add_systems(Startup, setup_ui)
-            .add_systems(Update, (
-                // UI Systems
-                handle_text_input,
-                update_fps_text,
-                update_cursor,
-                handle_button_clicks,
-                
-                // Visualization Systems
-                draw_spatial_grid,
-                toggle_grid_visibility,
-                update_trails,
-                cleanup_trails_on_toggle,
-            ).chain());
+    // Mode-specific setup
+    match config.mode {
+        SimulationMode::Interactive => {
+            // Add interactive mode systems
+            app.add_plugins(FrameTimeDiagnosticsPlugin::default())
+                .add_systems(Startup, setup_ui)
+                .add_systems(Update, (
+                    // UI Systems
+                    handle_text_input,
+                    update_fps_text,
+                    update_cursor,
+                    handle_button_clicks,
+                    handle_escape,
+                    
+                    // Visualization Systems
+                    draw_spatial_grid,
+                    toggle_grid_visibility,
+                    update_trails,
+                    cleanup_trails_on_toggle,
+                ).chain());
+        }
+        _ => {
+            // Add non-interactive mode systems
+            app.add_systems(Update, (
+                handle_non_interactive_modes,
+                apply_parameter_schedule,
+            ));
+
+            // Load validation data if in validation mode
+            if let SimulationMode::Validate = config.mode {
+                if let Some(ref path) = config.reference_path {
+                    let mut validator = app.world_mut().resource_mut::<DeterminismValidator>();
+                    validator.load_reference(path)
+                        .expect("Failed to load reference data");
+                }
+            }
+        }
     }
 
-    // Add benchmark/validation systems for non-interactive modes
-    if !matches!(config.mode, SimulationMode::Interactive) {
-        app.add_systems(Update, (
-            handle_non_interactive_modes,
-            apply_parameter_schedule,
-        ));
-    }
-
+    // Run the app
     app.run();
+}
+
+// Helper function to convert keycode to character
+fn key_code_to_char(key_code: KeyCode) -> Option<char> {
+    match key_code {
+        KeyCode::Digit0 | KeyCode::Numpad0 => Some('0'),
+        KeyCode::Digit1 | KeyCode::Numpad1 => Some('1'),
+        KeyCode::Digit2 | KeyCode::Numpad2 => Some('2'),
+        KeyCode::Digit3 | KeyCode::Numpad3 => Some('3'),
+        KeyCode::Digit4 | KeyCode::Numpad4 => Some('4'),
+        KeyCode::Digit5 | KeyCode::Numpad5 => Some('5'),
+        KeyCode::Digit6 | KeyCode::Numpad6 => Some('6'),
+        KeyCode::Digit7 | KeyCode::Numpad7 => Some('7'),
+        KeyCode::Digit8 | KeyCode::Numpad8 => Some('8'),
+        KeyCode::Digit9 | KeyCode::Numpad9 => Some('9'),
+        KeyCode::Period | KeyCode::NumpadDecimal => Some('.'),
+        _ => None,
+    }
 }

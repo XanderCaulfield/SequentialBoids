@@ -9,6 +9,7 @@ use bevy::{
         ButtonState,
     },
     
+    
 };
 use clap::Command;
 use noise::{NoiseFn, Perlin};
@@ -1607,7 +1608,7 @@ fn draw_spatial_grid(
            cell_pos.y >= -half_height - GRID_CELL_SIZE && 
            cell_pos.y <= half_height + GRID_CELL_SIZE {
             
-            let density = (entities.len() as f32) / (BOID_COUNT as f32);
+            let density = (entities.len() as f32) / ((BOID_COUNT / 5) as f32);
             let base_color = Color::srgba(1.0, 0.0, 0.0, density.min(0.5));
             
             gizmos.rect_2d(
@@ -1733,6 +1734,7 @@ fn main() {
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Boids Simulation".to_string(),
+                present_mode: bevy::window::PresentMode::Immediate,
                 ..default()
             }),
             ..default()

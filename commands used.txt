@@ -1,0 +1,12 @@
+cargo run --release -- --mode benchmark --boid-count 200 --seed 42 --duration 60 --output 200_boids_benchmark.json --params 200_params.json
+
+cargo run --release -- --mode benchmark --boid-count 600 --seed 123 --duration 60 --output 600_boids_benchmark.json --params 600_params.json
+
+cargo run --release -- --mode benchmark --boid-count 1200 --seed 789 --duration 60 --output 1200_boids_benchmark.json --params 1200_params.json
+
+cargo run --release -- --mode record --boid-count 200 --seed 42 --duration 60 --output 200_boids.json --params 200_params.json
+
+cargo run --release -- --mode record --boid-count 600 --seed 123 --duration 60 --output 600_boids.json --params 600_params.json
+
+cargo run --release -- --mode record --boid-count 1200 --seed 789 --duration 60 --output 1200_boids.json --params 1200_params.json
+

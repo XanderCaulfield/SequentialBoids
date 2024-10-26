@@ -25,8 +25,6 @@ use std::{
 };
 
 // ==================== Constants ====================
-
-const BOID_COUNT: usize = 200;
 const BOID_SPEED_LIMIT: f32 = 300.0;
 const TRAIL_LENGTH: usize = 25;
 const GRID_CELL_SIZE: f32 = 60.0;
@@ -173,6 +171,7 @@ pub struct SimulationConfig {
     pub parameter_schedule_path: Option<PathBuf>,
     pub rng_seed: u64,
     pub noise_seed: u32,
+    pub boid_count: usize,
 }
 
 /// Tracks performance metrics for benchmarking and analysis
@@ -595,6 +594,7 @@ impl Default for SimulationConfig {
             parameter_schedule_path: None,
             rng_seed: 42,        // Default RNG seed
             noise_seed: 1,       // Default noise seed
+            boid_count: 200,     // Default boid count
         }
     }
 }
@@ -659,17 +659,21 @@ impl SimulationConfig {
                 .long("seed")
                 .value_name("NUMBER")
                 .default_value("42"))
+            .arg(clap::Arg::new("boid-count")
+                .long("boid-count")
+                .value_name("NUMBER")
+                .default_value("200"))
             .get_matches();
 
-            let parameter_schedule_path = matches.get_one::<String>("params")
-            .map(|p| {
-                let path = PathBuf::from(p);
-                if !path.exists() {
-                    warn!("Parameter schedule file not found: {}", path.display());
-                }
+        // Helper function to create paths in the correct folders.
+        fn create_path(folder: &str, filename: Option<&str>) -> Option<PathBuf> {
+            filename.map(|f| {
+                let mut path = PathBuf::from(folder);
+                std::fs::create_dir_all(&path).expect("Failed to create directory");
+                path.push(f);
                 path
-            });
-
+            })
+        }
 
         let mode = match matches.get_one::<String>("mode").map(|s| s.as_str()) {
             Some("benchmark") => SimulationMode::Benchmark,
@@ -678,10 +682,28 @@ impl SimulationConfig {
             _ => SimulationMode::Interactive,
         };
 
+        // Create paths with appropriate folders
+        let output_path = match mode {
+            SimulationMode::Benchmark => create_path("Benchmarks", matches.get_one::<String>("output").map(|s| s.as_str())),
+            SimulationMode::Record => create_path("Recordings", matches.get_one::<String>("output").map(|s| s.as_str())),
+            _ => None,
+        };
+
+        let parameter_schedule_path = matches.get_one::<String>("params")
+            .map(|p| {
+                let mut path = PathBuf::from("PSchedules");
+                std::fs::create_dir_all(&path).expect("Failed to create PSchedules directory");
+                path.push(p);
+                if !path.exists() {
+                    warn!("Parameter schedule file not found: {}", path.display());
+                }
+                path
+            });
+
         Self {
             mode,
-            output_path: matches.get_one::<String>("output").map(PathBuf::from),
-            reference_path: matches.get_one::<String>("reference").map(PathBuf::from),
+            output_path,
+            reference_path: create_path("Recordings", matches.get_one::<String>("reference").map(|s| s.as_str())),
             fixed_time: Some(Time::<Fixed>::default()),
             benchmark_duration: matches.get_one::<String>("duration")
                 .and_then(|s| s.parse::<f64>().ok())
@@ -691,6 +713,9 @@ impl SimulationConfig {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(42),
             noise_seed: 1,
+            boid_count: matches.get_one::<String>("boid-count")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1000),
         }
     }
 }
@@ -705,10 +730,11 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut rng: ResMut<SimulationRng>,
+    config: Res<SimulationConfig>,
 ) {
     commands.spawn(Camera2dBundle::default());
     commands.insert_resource(SpatialGrid::default());
-    spawn_boids(&mut commands, &mut meshes, &mut materials, &mut rng);
+    spawn_boids(&mut commands, &mut meshes, &mut materials, &mut rng, &config);
 }
 
 /// Spawns initial boid entities with deterministic positions and velocities
@@ -717,11 +743,12 @@ fn spawn_boids(
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<ColorMaterial>>,
     rng: &mut ResMut<SimulationRng>,
+    config: &SimulationConfig,
 ) {
     let triangle = meshes.add(Mesh::from(RegularPolygon::new(5.0, 3)));
     let material = materials.add(ColorMaterial::from(Color::srgb(0.33, 0.55, 0.95)));
 
-    for i in 0..BOID_COUNT {
+    for i in 0..config.boid_count {
         // Generate deterministic initial conditions using the seeded RNG
         let velocity = Vec2::new(
             rng.0.gen_range(-150.0..150.0),
@@ -1452,7 +1479,7 @@ fn handle_button_clicks(
                     *rng = SimulationRng::new(config.rng_seed);
                     
                     // Spawn new boids with reset RNG
-                    spawn_boids(&mut commands, &mut meshes, &mut materials, &mut rng);
+                    spawn_boids(&mut commands, &mut meshes, &mut materials, &mut rng, &config);
                 }
                 UIElement::TracePathsButton => {
                     sim_params.trace_paths = !sim_params.trace_paths;
@@ -1556,6 +1583,7 @@ fn draw_spatial_grid(
     debug_config: Res<DebugConfig>,
     text_query: Query<Entity, With<GridCellText>>,
     window_query: Query<&Window>,
+    config: Res<SimulationConfig>,
 ) {
     // Clean up existing grid text entities
     for entity in text_query.iter() {
@@ -1608,7 +1636,7 @@ fn draw_spatial_grid(
            cell_pos.y >= -half_height - GRID_CELL_SIZE && 
            cell_pos.y <= half_height + GRID_CELL_SIZE {
             
-            let density = (entities.len() as f32) / ((BOID_COUNT / 5) as f32);
+            let density = (entities.len() as f32) / ((&config.boid_count / 5) as f32);
             let base_color = Color::srgba(1.0, 0.0, 0.0, density.min(0.5));
             
             gizmos.rect_2d(
@@ -1684,7 +1712,12 @@ fn handle_non_interactive_modes(
     validator: Res<DeterminismValidator>,
     time: Res<Time>,
     mut app_exit: EventWriter<AppExit>,
+    mut local: Local<bool>, // Local state to track if we've saved in benchmark and recording modes.
 ) {
+    if *local { // If we've already saved and triggered exit, do nothing.
+        return;
+    }
+
     match config.mode {
         SimulationMode::Interactive => return,
         SimulationMode::Benchmark => {
@@ -1695,6 +1728,7 @@ fn handle_non_interactive_modes(
                         metrics.save_benchmark_results(path)
                             .expect("Failed to save benchmark results");
                     }
+                    *local = true; // Mark as saved
                     app_exit.send(AppExit::Success);
                 }
             }
@@ -1706,8 +1740,9 @@ fn handle_non_interactive_modes(
                         info!("Saving reference data after {}s", time.elapsed().as_secs_f32());
                         validator.save_reference(path)
                             .expect("Failed to save reference data");
+                        info!("Recording complete - exiting");
                     }
-                    info!("Recording complete - exiting");
+                    *local = true;
                     app_exit.send(AppExit::Success);
                 }
             } else {
@@ -1718,6 +1753,7 @@ fn handle_non_interactive_modes(
             if let Some(duration) = config.benchmark_duration {
                 if time.elapsed() >= duration {
                     info!("Validation complete after {}s", time.elapsed().as_secs_f32());
+                    *local = true;
                     app_exit.send(AppExit::Success);
                 }
             }
